@@ -1,4 +1,6 @@
-use crate::configs::resource_quota::MemoryResourceQuota;
+use crate::{
+    configs::resource_quota::MemoryResourceQuota, streaming::compression::alg_type::CompressionAlg,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -12,11 +14,18 @@ pub struct SystemConfig {
     pub partition: PartitionConfig,
     pub segment: SegmentConfig,
     pub encryption: EncryptionConfig,
+    pub compression: CompressionConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DatabaseConfig {
     pub path: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct CompressionConfig {
+    pub enabled: bool,
+    pub alg: CompressionAlg,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

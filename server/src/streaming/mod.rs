@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod clients;
+pub mod compression;
 pub mod diagnostics;
 pub mod models;
 pub mod partitions;
