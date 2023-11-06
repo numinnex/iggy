@@ -3,18 +3,16 @@ use crate::quic::quic_sender::QuicSender;
 use crate::server_error::ServerError;
 use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::System;
+use crate::streaming::systems::system::SharedSystem;
 use iggy::bytes_serializable::BytesSerializable;
 use iggy::command::Command;
 use quinn::Endpoint;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 const LISTENERS_COUNT: u32 = 10;
 const INITIAL_BYTES_LENGTH: usize = 4;
 
-pub fn start(endpoint: Endpoint, system: Arc<RwLock<System>>) {
+pub fn start(endpoint: Endpoint, system: SharedSystem) {
     for _ in 0..LISTENERS_COUNT {
         let endpoint = endpoint.clone();
         let system = system.clone();
@@ -27,7 +25,7 @@ pub fn start(endpoint: Endpoint, system: Arc<RwLock<System>>) {
                 let system = system.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(incoming_connection, system).await {
-                        error!("Connection has failed: {}", error.to_string())
+                        error!("Connection has failed: {error}");
                     }
                 });
             }
@@ -37,18 +35,18 @@ pub fn start(endpoint: Endpoint, system: Arc<RwLock<System>>) {
 
 async fn handle_connection(
     incoming_connection: quinn::Connecting,
-    system: Arc<RwLock<System>>,
+    system: SharedSystem,
 ) -> Result<(), ServerError> {
     let connection = incoming_connection.await?;
     let address = connection.remote_address();
     async {
-        info!("Client has connected: {}", address);
+        info!("Client has connected: {address}");
         let client_id = system
             .read()
             .await
             .add_client(&address, Transport::Quic)
             .await;
-        let mut session = Session::from_client_id(client_id);
+        let mut session = Session::from_client_id(client_id, address.to_string());
         loop {
             let stream = connection.accept_bi().await;
             let mut stream = match stream {
@@ -67,15 +65,15 @@ async fn handle_connection(
 
             let request = stream.1.read_to_end(10 * 1024 * 1024).await;
             if request.is_err() {
-                error!("Error when reading the QUIC request: {:?}", request);
+                error!("Error when reading the QUIC request: {:?}", request.err());
                 continue;
             }
 
             let request = request.unwrap();
             if request.len() < INITIAL_BYTES_LENGTH {
                 error!(
-                "Unable to read the QUIC request length, expected: {} bytes, received: {} bytes.",
-                INITIAL_BYTES_LENGTH, request.len()
+                "Unable to read the QUIC request length, expected: {INITIAL_BYTES_LENGTH} bytes, received: {} bytes.",
+                request.len()
             );
                 continue;
             }
@@ -93,10 +91,7 @@ async fn handle_connection(
             }
 
             let command = command.unwrap();
-            debug!(
-                "Received a QUIC command: {}, payload size: {}",
-                command, length
-            );
+            debug!("Received a QUIC command: {command}, payload size: {length}");
 
             let result = command::handle(
                 &command,

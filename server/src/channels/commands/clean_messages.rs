@@ -1,12 +1,11 @@
-use crate::streaming::systems::system::System;
+use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::topics::topic::Topic;
 use crate::{channels::server_command::ServerCommand, configs::server::MessageCleanerConfig};
 use async_trait::async_trait;
 use flume::Sender;
 use iggy::error::Error;
 use iggy::utils::timestamp::TimeStamp;
-use std::{sync::Arc, time::Duration};
-use tokio::sync::RwLock;
+use std::time::Duration;
 use tokio::time;
 use tracing::{error, info};
 
@@ -53,9 +52,9 @@ impl MessagesCleaner {
             let mut interval_timer = time::interval(interval);
             loop {
                 interval_timer.tick().await;
-                if sender.send(CleanMessagesCommand).is_err() {
-                    error!("Failed to send CleanMessagesCommand");
-                }
+                sender.send(CleanMessagesCommand).unwrap_or_else(|err| {
+                    error!("Failed to send CleanMessagesCommand. Error: {}", err);
+                });
             }
         });
     }
@@ -63,7 +62,7 @@ impl MessagesCleaner {
 
 #[async_trait]
 impl ServerCommand<CleanMessagesCommand> for CleanMessagesExecutor {
-    async fn execute(&mut self, system: &Arc<RwLock<System>>, _command: CleanMessagesCommand) {
+    async fn execute(&mut self, system: &SharedSystem, _command: CleanMessagesCommand) {
         let now = TimeStamp::now().to_micros();
         let system_read = system.read().await;
         let streams = system_read.get_streams();
@@ -97,7 +96,7 @@ impl ServerCommand<CleanMessagesCommand> for CleanMessagesExecutor {
 
     fn start_command_sender(
         &mut self,
-        _system: Arc<RwLock<System>>,
+        _system: SharedSystem,
         config: &crate::configs::server::ServerConfig,
         sender: Sender<CleanMessagesCommand>,
     ) {
@@ -107,7 +106,7 @@ impl ServerCommand<CleanMessagesCommand> for CleanMessagesExecutor {
 
     fn start_command_consumer(
         mut self,
-        system: Arc<RwLock<System>>,
+        system: SharedSystem,
         _config: &crate::configs::server::ServerConfig,
         receiver: flume::Receiver<CleanMessagesCommand>,
     ) {
@@ -146,27 +145,29 @@ async fn delete_expired_segments(
     let mut segments_count = 0;
     let mut messages_count = 0;
     for (partition_id, start_offsets) in &expired_segments {
-        let partition = topic.get_partition(*partition_id);
-        if partition.is_err() {
-            error!(
-                "Partition with ID: {} not found for stream ID: {}, topic ID: {}",
-                partition_id, topic.stream_id, topic.topic_id
-            );
-            continue;
-        }
-        let partition = partition.unwrap();
-        let mut partition = partition.write().await;
-        let mut last_end_offset = 0;
-        for start_offset in start_offsets {
-            let deleted_segment = partition.delete_segment(*start_offset).await?;
-            last_end_offset = deleted_segment.end_offset;
-            segments_count += 1;
-            messages_count += deleted_segment.get_messages_count();
-        }
+        match topic.get_partition(*partition_id) {
+            Ok(partition) => {
+                let mut partition = partition.write().await;
+                let mut last_end_offset = 0;
+                for start_offset in start_offsets {
+                    let deleted_segment = partition.delete_segment(*start_offset).await?;
+                    last_end_offset = deleted_segment.end_offset;
+                    segments_count += 1;
+                    messages_count += deleted_segment.get_messages_count();
+                }
 
-        if partition.get_segments().is_empty() {
-            let start_offset = last_end_offset + 1;
-            partition.add_persisted_segment(start_offset).await?;
+                if partition.get_segments().is_empty() {
+                    let start_offset = last_end_offset + 1;
+                    partition.add_persisted_segment(start_offset).await?;
+                }
+            }
+            Err(error) => {
+                error!(
+                    "Partition with ID: {} not found for stream ID: {}, topic ID: {}. Error: {}",
+                    partition_id, topic.stream_id, topic.topic_id, error
+                );
+                continue;
+            }
         }
     }
 

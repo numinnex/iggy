@@ -20,6 +20,35 @@ use tokio::time::Instant;
 use tracing::{info, trace};
 
 #[derive(Debug)]
+pub struct SharedSystem {
+    system: Arc<RwLock<System>>,
+}
+
+impl SharedSystem {
+    pub fn new(system: System) -> SharedSystem {
+        SharedSystem {
+            system: Arc::new(RwLock::new(system)),
+        }
+    }
+
+    pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, System> {
+        self.system.read().await
+    }
+
+    pub async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, System> {
+        self.system.write().await
+    }
+}
+
+impl Clone for SharedSystem {
+    fn clone(&self) -> Self {
+        SharedSystem {
+            system: self.system.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct System {
     pub permissioner: Permissioner,
     pub(crate) storage: Arc<SystemStorage>,
@@ -95,15 +124,14 @@ impl System {
     }
 
     pub async fn init(&mut self) -> Result<(), Error> {
-        if !Path::new(&self.config.get_system_path()).exists()
-            && create_dir(&self.config.get_system_path()).await.is_err()
-        {
-            return Err(Error::CannotCreateBaseDirectory);
+        let system_path = self.config.get_system_path();
+        if !Path::new(&system_path).exists() && create_dir(&system_path).await.is_err() {
+            return Err(Error::CannotCreateBaseDirectory(system_path));
         }
-        if !Path::new(&self.config.get_streams_path()).exists()
-            && create_dir(&self.config.get_streams_path()).await.is_err()
-        {
-            return Err(Error::CannotCreateStreamsDirectory);
+
+        let streams_path = self.config.get_streams_path();
+        if !Path::new(&streams_path).exists() && create_dir(&streams_path).await.is_err() {
+            return Err(Error::CannotCreateStreamsDirectory(streams_path));
         }
 
         info!(

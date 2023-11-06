@@ -2,16 +2,13 @@ extern crate rmp_serde as rmps;
 extern crate serde;
 extern crate serde_derive;
 
+use crate::errors_repository::load_errors;
+use convert_case::{Case, Casing};
+use errors_repository::PreprocessedErrorRepositoryEntry;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
-
-use convert_case::{Case, Casing};
-
-use errors_repository::PreprocessedErrorRepositoryEntry;
-
-use crate::errors_repository::load_errors;
 
 mod errors_repository;
 
@@ -24,6 +21,7 @@ struct ErrorEnumVariant {
     template: String,
     signature: String,
     converts_from: String,
+    source: String,
 }
 
 struct ErrorEnum {
@@ -37,6 +35,7 @@ impl From<PreprocessedErrorRepositoryEntry> for ErrorEnumVariant {
             snake_case_name: value.snake_case_name,
             template: value.template,
             signature: value.signature,
+            source: value.source,
             converts_from: value.converts_from,
         }
     }
@@ -58,12 +57,24 @@ impl ErrorEnumVariant {
         ));
         let signature = &self.signature;
         let converts_from = &self.converts_from;
+        let source_from = &self.source;
 
-        match (converts_from.is_empty(), signature.is_empty()) {
-            (true, true) => (),
-            (true, false) => result.push_str(&format!("({})", signature)),
-            (false, true) => result.push_str(&format!("(#[from] {})", converts_from)),
-            (false, false) => result.push_str(&format!("({}, {})", converts_from, signature)),
+        match (
+            converts_from.is_empty(),
+            signature.is_empty(),
+            source_from.is_empty(),
+        ) {
+            (true, true, true) => (),
+            (true, false, true) => result.push_str(&format!("({})", signature)),
+            (false, true, true) => result.push_str(&format!("(#[from] {})", converts_from)),
+            (false, false, true) => result.push_str(&format!("({}, {})", converts_from, signature)),
+            (true, true, false) => result.push_str(&format!("(#[source] {})", source_from)),
+            (true, false, false) => {
+                result.push_str(&format!("(#[source] {}, {})", source_from, signature))
+            }
+            _ => {
+                panic!("Only one of [converts_from, source] can be set")
+            }
         };
 
         result

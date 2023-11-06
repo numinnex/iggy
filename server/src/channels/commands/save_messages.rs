@@ -1,16 +1,14 @@
+use crate::channels::server_command::ServerCommand;
 use crate::configs::server::MessageSaverConfig;
 use crate::configs::server::ServerConfig;
 use crate::streaming::persistence::persister::*;
 use crate::streaming::segments::storage::FileSegmentStorage;
-use crate::streaming::systems::system::System;
+use crate::streaming::systems::system::SharedSystem;
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use std::{sync::Arc, time::Duration};
-use tokio::sync::RwLock;
 use tokio::time;
 use tracing::{error, info, warn};
-
-use crate::channels::server_command::ServerCommand;
 
 pub struct MessagesSaver {
     enforce_fsync: bool,
@@ -54,9 +52,9 @@ impl MessagesSaver {
             loop {
                 interval_timer.tick().await;
                 let command = SaveMessagesCommand { enforce_fsync };
-                if sender.send(command).is_err() {
-                    error!("Failed to send SaveMessagesCommand");
-                }
+                sender.send(command).unwrap_or_else(|error| {
+                    error!("Failed to send SaveMessagesCommand. Error: {}", error);
+                });
             }
         });
     }
@@ -64,7 +62,7 @@ impl MessagesSaver {
 
 #[async_trait]
 impl ServerCommand<SaveMessagesCommand> for SaveMessagesExecutor {
-    async fn execute(&mut self, system: &Arc<RwLock<System>>, command: SaveMessagesCommand) {
+    async fn execute(&mut self, system: &SharedSystem, command: SaveMessagesCommand) {
         let persister: Arc<dyn Persister> = if command.enforce_fsync {
             Arc::new(FileWithSyncPersister)
         } else {
@@ -72,21 +70,20 @@ impl ServerCommand<SaveMessagesCommand> for SaveMessagesExecutor {
         };
 
         let storage = Arc::new(FileSegmentStorage::new(persister));
-        if system
+        system
             .write()
             .await
             .persist_messages(storage)
             .await
-            .is_err()
-        {
-            error!("Couldn't save buffered messages on disk.");
-        }
+            .unwrap_or_else(|error| {
+                error!("Couldn't save buffered messages on disk. Error: {}", error);
+            });
         info!("Buffered messages saved on disk.");
     }
 
     fn start_command_sender(
         &mut self,
-        _system: Arc<RwLock<System>>,
+        _system: SharedSystem,
         config: &ServerConfig,
         sender: Sender<SaveMessagesCommand>,
     ) {
@@ -96,7 +93,7 @@ impl ServerCommand<SaveMessagesCommand> for SaveMessagesExecutor {
 
     fn start_command_consumer(
         mut self,
-        system: Arc<RwLock<System>>,
+        system: SharedSystem,
         _config: &ServerConfig,
         receiver: Receiver<SaveMessagesCommand>,
     ) {

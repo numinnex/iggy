@@ -15,7 +15,8 @@ impl System {
         info!("Loading streams from disk...");
         let mut unloaded_streams = Vec::new();
         let dir_entries = read_dir(&self.config.get_streams_path()).await;
-        if dir_entries.is_err() {
+        if let Err(error) = dir_entries {
+            error!("Cannot read streams directory: {}", error);
             return Err(Error::CannotReadStreams);
         }
 
@@ -38,12 +39,17 @@ impl System {
         for mut stream in unloaded_streams {
             let loaded_streams = loaded_streams.clone();
             let load_stream = tokio::spawn(async move {
-                if stream.load().await.is_err() {
-                    error!("Failed to load stream with ID: {}.", stream.stream_id);
-                    return;
+                match stream.load().await {
+                    Ok(_) => {
+                        loaded_streams.lock().await.push(stream);
+                    }
+                    Err(error) => {
+                        error!(
+                            "Failed to load stream with ID: {}. Error: {}",
+                            stream.stream_id, error
+                        );
+                    }
                 }
-
-                loaded_streams.lock().await.push(stream);
             });
             load_streams.push(load_stream);
         }
@@ -277,7 +283,7 @@ mod tests {
         let mut system =
             System::create(config, storage, None, PersonalAccessTokenConfig::default());
         let root = User::root();
-        let session = Session::new(1, root.id);
+        let session = Session::new(1, root.id, "127.0.0.1".to_string());
         system.permissioner.init_permissions_for_user(root);
         system
             .create_stream(&session, stream_id, stream_name)
