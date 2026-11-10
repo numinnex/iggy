@@ -78,6 +78,54 @@ impl Collector for StatsRollupUnderflows {
     }
 }
 
+/// Exports the node's free-space reserve, read at encode time from the state
+/// the disk sampler publishes. Absent when the reserve is disabled.
+#[derive(Debug)]
+struct DataDiskFreeSpace;
+
+impl Collector for DataDiskFreeSpace {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        let Some(reserve) = crate::sysinfo_probe::free_space_reserve() else {
+            return Ok(());
+        };
+        encode_free_space(&mut encoder, &reserve)
+    }
+}
+
+fn encode_free_space(
+    encoder: &mut DescriptorEncoder,
+    reserve: &partitions::FreeSpaceReserve,
+) -> Result<(), std::fmt::Error> {
+    let gauges = [
+        (
+            "data_disk_free_bytes",
+            "free space on the disk of the data directory in bytes, as last sampled",
+            reserve.free_bytes(),
+        ),
+        (
+            "data_disk_free_space_reserve_bytes",
+            "free space the node keeps on the disk of the data directory in bytes",
+            reserve.reserve_bytes(),
+        ),
+        (
+            "data_disk_below_free_space_reserve",
+            "1 while the data disk is below its reserve and the node refuses new messages, else 0",
+            u64::from(reserve.is_short()),
+        ),
+    ];
+    for (name, help, value) in gauges {
+        let gauge = ConstGauge::new(value);
+        gauge.encode(encoder.encode_descriptor(name, help, None, gauge.metric_type())?)?;
+    }
+    let refused = ConstCounter::new(reserve.refused_requests());
+    refused.encode(encoder.encode_descriptor(
+        "messages_refused_for_free_space",
+        "total count of message requests refused while the data disk was below its reserve",
+        None,
+        refused.metric_type(),
+    )?)
+}
+
 /// One topic's usage as the scrape handler sampled it from the streams STM.
 #[derive(Debug)]
 pub(in crate::http) struct TopicUsageSample {
@@ -242,6 +290,7 @@ impl HttpMetrics {
         // Not a legacy-parity metric, and not a mirrored one: the source is a
         // process-wide static the scrape reads directly.
         registry.register_collector(Box::new(StatsRollupUnderflows));
+        registry.register_collector(Box::new(DataDiskFreeSpace));
         let topic_usage = TopicUsage::default();
         registry.register_collector(Box::new(topic_usage.clone()));
         // Every shard's drop / reconcile / partition counters, one
@@ -330,6 +379,49 @@ pub(in crate::http) fn gauge_value(count: u64) -> i64 {
 mod tests {
     use super::*;
     use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
+
+    #[derive(Debug)]
+    struct SampledFreeSpace(Arc<partitions::FreeSpaceReserve>);
+
+    impl Collector for SampledFreeSpace {
+        fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+            encode_free_space(&mut encoder, &self.0)
+        }
+    }
+
+    #[test]
+    fn given_a_short_data_disk_when_scraping_should_export_the_reserve_and_the_refusals() {
+        let reserve = Arc::new(partitions::FreeSpaceReserve::new(1024));
+        reserve.observe(512);
+        assert!(reserve.refuses_messages());
+        let mut registry = Registry::default();
+        registry.register_collector(Box::new(SampledFreeSpace(Arc::clone(&reserve))));
+
+        let mut short = String::new();
+        encode(&mut short, &registry).unwrap();
+        reserve.observe(2048);
+        let mut recovered = String::new();
+        encode(&mut recovered, &registry).unwrap();
+
+        for line in [
+            "data_disk_free_bytes 512",
+            "data_disk_free_space_reserve_bytes 1024",
+            "data_disk_below_free_space_reserve 1",
+            "messages_refused_for_free_space_total 1",
+        ] {
+            assert!(short.lines().any(|found| found == line), "{line}\n{short}");
+        }
+        for line in [
+            "data_disk_free_bytes 2048",
+            "data_disk_below_free_space_reserve 0",
+            "messages_refused_for_free_space_total 1",
+        ] {
+            assert!(
+                recovered.lines().any(|found| found == line),
+                "{line}\n{recovered}"
+            );
+        }
+    }
 
     #[test]
     fn shard_metrics_land_in_the_exposition_under_a_shard_label() {
