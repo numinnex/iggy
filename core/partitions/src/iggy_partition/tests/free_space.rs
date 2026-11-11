@@ -21,15 +21,25 @@ use iggy_binary_protocol::{
     PrepareHeader, RoutedRequestHeader, requests::partitions::TransitionPartitionHistoryRequest,
 };
 use iggy_common::IggyError;
-use server_common::Message;
+use server_common::{DiskUsage, Message};
 use std::sync::Arc;
 
 const RESERVE_BYTES: u64 = 1 << 30;
 
-fn short_reserve() -> Arc<FreeSpaceReserve> {
-    let reserve = Arc::new(FreeSpaceReserve::new(RESERVE_BYTES));
-    reserve.observe(RESERVE_BYTES - 1);
+const USED_BYTES: u64 = 1 << 40;
+
+/// These tests charge nothing, so one estimate serves them all.
+static USAGE: DiskUsage = DiskUsage::new();
+
+fn reserve_with(free_bytes: u64) -> Arc<FreeSpaceReserve> {
+    USAGE.rebase(|| Some(((), USED_BYTES)));
+    let reserve = Arc::new(FreeSpaceReserve::new(RESERVE_BYTES, &USAGE));
+    reserve.observe(free_bytes, USED_BYTES);
     reserve
+}
+
+fn short_reserve() -> Arc<FreeSpaceReserve> {
+    reserve_with(RESERVE_BYTES - 1)
 }
 
 fn send_request<B: MessageBus>(partition: &IggyPartition<B>) -> Message<RoutedRequestHeader> {
@@ -65,7 +75,7 @@ async fn given_a_short_data_disk_when_the_primary_gets_messages_should_refuse_th
     );
     assert_eq!(reserve.refused_requests(), 1);
 
-    reserve.observe(RESERVE_BYTES);
+    reserve.observe(RESERVE_BYTES, USED_BYTES);
     partition.on_request(send_request(&partition), None).await;
     assert_eq!(partition.consensus.sequencer().current_sequence(), 1);
     assert_eq!(reserve.refused_requests(), 1);
@@ -107,7 +117,7 @@ async fn given_a_short_data_disk_on_a_backup_only_when_the_primary_gets_messages
  {
     let (mut primary, _) = recording_partition_at(0, 3);
     primary.runtime_options.durability = iggy_common::Durability::Replicated;
-    primary.set_free_space_reserve(Some(Arc::new(FreeSpaceReserve::new(RESERVE_BYTES))));
+    primary.set_free_space_reserve(Some(reserve_with(RESERVE_BYTES)));
     let (mut backup, _) = recording_partition_at(1, 3);
     backup.runtime_options.durability = iggy_common::Durability::Replicated;
     let reserve = short_reserve();

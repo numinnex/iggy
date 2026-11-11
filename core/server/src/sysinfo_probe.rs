@@ -22,6 +22,7 @@
 use arc_swap::ArcSwap;
 use nix::sys::resource::{Resource, getrlimit};
 use partitions::{FreeSpaceChange, FreeSpaceReserve};
+use server_common::DISK_USAGE;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -109,7 +110,7 @@ pub fn init_stats_data_path(path: PathBuf) {
 /// whether the node boots short. A reserve of 0 installs nothing.
 pub fn init_free_space_reserve(reserve_bytes: u64) {
     if reserve_bytes > 0 {
-        let _ = FREE_SPACE_RESERVE.set(Arc::new(FreeSpaceReserve::new(reserve_bytes)));
+        let _ = FREE_SPACE_RESERVE.set(Arc::new(FreeSpaceReserve::new(reserve_bytes, &DISK_USAGE)));
     }
 }
 
@@ -155,14 +156,23 @@ impl SystemStats {
     fn capture(sys: &mut SysinfoSystem, previous_open_files: u64, scan_open_files: bool) -> Self {
         let host = HOST_IDENTITY.get_or_init(HostIdentity::probe);
         let probe = SystemProbe::capture(sys);
-        let disk = STATS_DATA_PATH
-            .get()
-            .and_then(|path| fs2::statvfs(path).ok());
-        // A failed sample keeps the last verdict: neither refusing messages
-        // nor accepting them again on a disk that could not be measured.
-        if let (Some(reserve), Some(disk)) = (FREE_SPACE_RESERVE.get(), disk.as_ref()) {
-            observe_free_space(reserve, disk.available_space());
+        // Each sample also re-bases the disk usage estimate the write sites
+        // charge, and the first one, taken before the shards start, seeds it.
+        let disk = STATS_DATA_PATH.get().and_then(|path| {
+            DISK_USAGE.rebase(|| {
+                let stats = fs2::statvfs(path).ok()?;
+                let used_bytes = stats.total_space().saturating_sub(stats.free_space());
+                Some(((stats, used_bytes), used_bytes))
+            })
+        });
+        // A failed sample keeps the last one: neither refusing messages nor
+        // accepting them again on a disk that could not be measured.
+        if let (Some(reserve), Some((stats, used_bytes))) =
+            (FREE_SPACE_RESERVE.get(), disk.as_ref())
+        {
+            observe_free_space(reserve, stats.available_space(), *used_bytes);
         }
+        let disk = disk.map(|(stats, _)| stats);
         Self {
             process_id: probe.process_id,
             cpu_usage: probe.cpu_usage,
@@ -192,9 +202,9 @@ impl SystemStats {
     }
 }
 
-fn observe_free_space(reserve: &FreeSpaceReserve, free_bytes: u64) {
+fn observe_free_space(reserve: &FreeSpaceReserve, free_bytes: u64, used_bytes: u64) {
     let reserve_bytes = reserve.reserve_bytes();
-    match reserve.observe(free_bytes) {
+    match reserve.observe(free_bytes, used_bytes) {
         FreeSpaceChange::FellShort => error!(
             free_bytes,
             reserve_bytes,

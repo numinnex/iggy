@@ -1377,10 +1377,11 @@ handshake_grace = "10 s"
 # can still free space. Without the reserve a full disk fails a WAL write and
 # stops the node.
 #
-# The disk is sampled once a second, so size the reserve above what the node
-# can write in a second. A backup does not refuse what its primary replicates:
-# give every node of a cluster the same disk size, or watch
-# 'data_disk_below_free_space_reserve' on each node.
+# The free space is the last sample of the disk, taken once a second, minus
+# what the node wrote since, so a burst between two samples is counted. A
+# backup does not refuse what its primary replicates: give every node of a
+# cluster the same disk size, or watch 'data_disk_below_free_space_reserve' on
+# each node.
 #
 # "0" disables the reserve.
 free_space_reserve = "1 GiB"
