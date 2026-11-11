@@ -9794,6 +9794,7 @@ dependencies = [
  "iggy",
  "iggy_binary_protocol",
  "iggy_common",
+ "iggy_object_store",
  "journal",
  "jsonwebtoken 11.1.0",
  "left-right",
