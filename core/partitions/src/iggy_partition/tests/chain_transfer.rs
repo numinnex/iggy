@@ -156,8 +156,35 @@ async fn given_a_tiered_origin_when_offering_should_carry_its_chain_and_no_remot
             ChainRecord::Remote(sealed[0]),
             ChainRecord::Remote(sealed[1]),
             ChainRecord::Sealed(sealed[2]),
+            // The local segment that an advance confirmed carries its proof.
+            ChainRecord::Advanced(crate::tiered_floor::AdvanceTieredFloor {
+                start: sealed[2].start_offset,
+                up_to: sealed[2].end_offset,
+                hash: sealed[2].hash,
+            }),
         ]
     );
+}
+
+/// A replica rebuilt by a transfer never applies the advances below the floor
+/// it starts from, so the proof that a local segment is stored has to arrive
+/// with the chain, or that segment would stay on its disk for good.
+#[compio::test]
+async fn given_a_confirmed_local_segment_when_its_chain_is_installed_should_let_the_receiver_evict_it()
+ {
+    let (_origin_directory, mut origin) = Box::pin(tiered_origin()).await;
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut receiver) = Box::pin(receiver_on_disk(root.path())).await;
+    Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
+    assert_eq!(locations(&receiver)[2], SegmentLocation::Local);
+    drop(receiver);
+
+    // The proof is in the chain file, so it also survives the restart.
+    let mut rebooted = Box::pin(reboot(&config)).await;
+    Box::pin(evict(&mut rebooted, u64::MAX, KEEP_NOTHING)).await;
+
+    assert_eq!(locations(&rebooted)[2], SegmentLocation::Remote);
 }
 
 /// A rebuilt replica holds the sender's records and front, keeps no tiered

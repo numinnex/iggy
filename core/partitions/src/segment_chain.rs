@@ -960,6 +960,33 @@ impl SegmentChain {
                 ChainRecord::Sealed(*segment)
             }
         }));
+        // The receiver holds the sender's segments, so what an advance proved
+        // about them here holds there. Without these it would never evict the
+        // segments it received: the advances that covered them are below the
+        // floor it starts from, and are not applied again. A remote segment
+        // needs none, since nothing is left to evict.
+        records.extend(
+            self.confirmed
+                .iter()
+                .filter(|start_offset| !self.remote.contains(start_offset))
+                .filter_map(|start_offset| self.sealed.get(start_offset))
+                .map(|segment| {
+                    ChainRecord::Advanced(AdvanceTieredFloor {
+                        start: segment.start_offset,
+                        up_to: segment.end_offset,
+                        hash: segment.hash,
+                    })
+                }),
+        );
+        // An advance that waits for its segment to seal waits on the receiver
+        // too. Only the end and the hash are compared, so the start is not kept.
+        records.extend(self.advances.iter().map(|(up_to, hash)| {
+            ChainRecord::Advanced(AdvanceTieredFloor {
+                start: *up_to,
+                up_to: *up_to,
+                hash: *hash,
+            })
+        }));
         Chain {
             prefix: self.prefix,
             valid_len: (HEADER_SIZE + records.len() * RECORD_SIZE) as u64,
