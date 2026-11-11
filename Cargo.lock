@@ -7780,6 +7780,7 @@ dependencies = [
  "server_common",
  "smallvec",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -9952,6 +9953,7 @@ dependencies = [
  "hash32",
  "iggy_binary_protocol",
  "iggy_common",
+ "iggy_object_store",
  "journal",
  "message_bus",
  "metadata",
