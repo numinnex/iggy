@@ -262,13 +262,10 @@ mod tests {
     fn given_tiered_read_failure_when_recording_should_keep_its_code_and_kind() {
         let mut read_error = ffi::ReadErrorInfo::default();
 
-        read_error.record(&ReadError {
-            partition_id: Some(PARTITION),
-            error: IggyError::TieredReadFailed,
-            skip: None,
-            offset: None,
-            record: None,
-        });
+        read_error.record(&ReadError::new(
+            Some(PARTITION),
+            IggyError::TieredReadFailed,
+        ));
 
         assert_eq!(read_error.error.code, 96);
         assert_eq!(read_error.error.kind, "tiered_read_failed");
