@@ -187,7 +187,11 @@ public class OptionsTests
             MessagesRequiredToSave = 1,
             SizeOfMessagesRequiredToSave = 1,
             PreallocateSegments = true,
-            ReplicationFactor = 1
+            ReplicationFactor = 1,
+            SegmentMaxAge = TimeSpan.FromHours(1),
+            TieredStorage = false,
+            LocalRetentionAge = TimeSpan.FromHours(1),
+            LocalRetentionSize = 1_000_000_000
         }.ToDictionary().Keys;
 
         typedKeys.ShouldAllBe(key => catalogKeys.Contains(key));
