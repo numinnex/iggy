@@ -69,6 +69,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use compio::driver::ProactorBuilder;
+use compio::runtime::{Runtime, RuntimeBuilder};
 use futures::channel::oneshot;
 use futures::future::{self, Either};
 use futures::stream::{self, StreamExt};
@@ -90,6 +92,21 @@ const LARGE_PIECE_LEN: usize = 64 * 1024;
 const LARGE_PIECES: usize = 128;
 /// The most bytes of the large body that a store holds at once: an eighth.
 const LARGE_BODY_HELD_LEN: usize = 1024 * 1024;
+
+/// A runtime like a shard's, to run the cases of a provider that needs one.
+/// On Linux it has no blocking pool, so a call that needs one panics.
+#[must_use]
+pub fn shard_runtime() -> Runtime {
+    let mut proactor = ProactorBuilder::new();
+    // macOS runs fs calls on the blocking pool, so it keeps one.
+    if cfg!(target_os = "linux") {
+        proactor.thread_pool_limit(0);
+    }
+    RuntimeBuilder::new()
+        .with_proactor(proactor)
+        .build()
+        .expect("runtime")
+}
 
 /// Calls `$callback!` with the name of every case in [`crate::contract`]
 /// that every provider runs, so a provider's tests pick up new cases on their
