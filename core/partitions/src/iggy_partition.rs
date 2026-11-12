@@ -13592,7 +13592,7 @@ where
     ///
     /// `None` when the advance would reach over offsets that this replica
     /// removed and nothing committed as deleted, as for
-    /// [`Self::floor_advance_over`]. The segment counts as uploaded either
+    /// `floor_advance_over`. The segment counts as uploaded either
     /// way, and [`Self::pending_floor_advance`] offers its advance once the
     /// watermark covers them.
     pub fn note_segment_uploaded(
