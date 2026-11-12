@@ -312,6 +312,8 @@ where
     incarnation: crate::PartitionIncarnation,
     workerless_offset_files: Rc<crate::offset_storage::RetainedOffsetFiles<compio::fs::File>>,
     poll_notifier: Option<Rc<dyn Fn()>>,
+    /// The node's reserve on the data disk. `None` never refuses.
+    free_space_reserve: Option<Arc<crate::FreeSpaceReserve>>,
     /// Committed consumer-offset membership and values. This is deliberately
     /// separate from the eager poll maps because follower-local and uncommitted
     /// auto-commit progress must never consume a durable slot or enter a state
@@ -996,6 +998,7 @@ where
             incarnation: crate::PartitionIncarnation::default(),
             workerless_offset_files: Rc::default(),
             poll_notifier: None,
+            free_space_reserve: None,
             durable_consumer_offsets: DurableConsumerOffsets::default(),
             explicit_offset_stores: ExplicitOffsetStores::default(),
             consumer_offset_capacities: ConsumerKind::ALL
@@ -3133,7 +3136,9 @@ where
             history_transition: self.history_transition,
             owner_retirement: self.owner_retirement.take(),
             producers: std::mem::take(&mut self.producers),
-            machines: (!self.state_machines.is_empty())
+            machines: self
+                .state_machines
+                .holds_state()
                 .then(|| self.state_machines.capture(self.consensus().commit_min())),
             durable_offset: self.offset.load(Ordering::Acquire),
             write_offset: self.dirty_offset.load(Ordering::Relaxed),
@@ -4564,6 +4569,13 @@ where
     /// and it must not re-enter the partition.
     pub fn set_poll_notifier(&mut self, notifier: Option<Rc<dyn Fn()>>) {
         self.poll_notifier = notifier;
+    }
+
+    /// While the reserve is short, this partition refuses new messages as a
+    /// primary. A backup keeps journalling, because a replica that refuses
+    /// prepares stalls the commit of every group that needs its ack.
+    pub fn set_free_space_reserve(&mut self, reserve: Option<Arc<crate::FreeSpaceReserve>>) {
+        self.free_space_reserve = reserve;
     }
 
     pub(crate) fn publish_poll_visibility(&self) {
@@ -7705,6 +7717,25 @@ where
                     message.header(),
                     IggyError::HistoryUnavailable.as_code(),
                     "request history is no longer available",
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
+            // Only messages grow the disk without bound. Offsets, segment
+            // deletion and every other operation stay admitted, so a consumer
+            // and retention can still make room.
+            if message.header().operation == Operation::SendMessages
+                && self
+                    .free_space_reserve
+                    .as_ref()
+                    .is_some_and(|reserve| reserve.refuses_messages())
+            {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "data disk is below its free-space reserve",
                     reply.take(),
                 )
                 .await;

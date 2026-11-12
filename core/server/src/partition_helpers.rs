@@ -754,6 +754,9 @@ async fn load_partition(
     };
     let segment_checkpoint = recovered_persistence.0.segment_checkpoint();
     let mut partition = IggyPartition::new(stats.clone(), consensus);
+    partition
+        .register_builtin_state_machines()
+        .map_err(ServerError::PartitionStateMachines)?;
     partition.set_runtime_options(runtime_options);
     // The chain file comes with the partition of a tiered topic, and a chain
     // that a crash left short of a record is completed here.
@@ -776,6 +779,7 @@ async fn load_partition(
     partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir.clone());
     partition.set_created_revision(partition_metadata.created_revision);
+    partition.set_free_space_reserve(crate::sysinfo_probe::free_space_reserve());
     partition
         .restore_retry_checkpoint(recovered_persistence.0.checkpoint_op())
         .await
@@ -1143,6 +1147,9 @@ pub async fn build_partition_fresh(
 
     let mut partition = IggyPartition::new(stats, consensus);
     partition
+        .register_builtin_state_machines()
+        .map_err(ServerError::PartitionStateMachines)?;
+    partition
         .consensus()
         .set_recovery_election_allowed(first_initialization && !lost_with_storage);
     partition.set_runtime_options(runtime_options);
@@ -1165,6 +1172,7 @@ pub async fn build_partition_fresh(
     partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir);
     partition.set_created_revision(created_revision);
+    partition.set_free_space_reserve(crate::sysinfo_probe::free_space_reserve());
     partition.created_at = IggyTimestamp::now();
     partition.offset.store(0, Ordering::Release);
     partition.dirty_offset.store(0, Ordering::Relaxed);

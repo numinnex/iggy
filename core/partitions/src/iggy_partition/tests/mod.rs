@@ -1883,6 +1883,7 @@ mod consumer_group_ownership;
 mod disk_poll;
 mod empty_offsets;
 mod eviction;
+mod free_space;
 mod history;
 mod materialization;
 mod materialization_io;
