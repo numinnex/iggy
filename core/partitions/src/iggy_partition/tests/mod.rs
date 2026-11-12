@@ -1884,6 +1884,7 @@ mod disk_poll;
 mod empty_offsets;
 mod eviction;
 mod floor_eviction;
+mod free_space;
 mod history;
 mod materialization;
 mod materialization_io;
