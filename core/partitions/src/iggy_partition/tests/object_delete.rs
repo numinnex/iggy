@@ -23,7 +23,8 @@ use super::*;
 use crate::{
     DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY, MAX_QUEUED_INCARNATIONS,
     ObjectDeleteDone, ObjectDeleteWork, ObjectDeleter, RETIRED_OBJECT_GRACE, SegmentLocation,
-    SweptObjects, delete_incarnation, delete_objects, list_segment_starts, upload_segment,
+    SweptObjects, delete_incarnation, delete_objects, delete_segments, list_segment_starts,
+    upload_segment,
 };
 use iggy_object_store::{
     DeleteFailure, DeleteOutcome, InlineTierExecutor, ListPage, ListRequest, ListedObject,
@@ -394,8 +395,8 @@ async fn given_a_delete_that_fails_when_it_finishes_should_keep_its_segments_que
     assert_eq!(queued(&partition), both);
     assert_eq!(store(&deleter).inner.len(), 4);
 
-    // The store refuses one object of the second segment.
-    let refused = key_of(PREFIX, SEALED[1].0, SegmentObject::Index);
+    // The store refuses the `.log` of the second segment.
+    let refused = key_of(PREFIX, SEALED[1].0, SegmentObject::Log);
     store(&deleter)
         .deletes
         .replace(Deletes::RefuseKey(refused.clone()));
@@ -413,6 +414,73 @@ async fn given_a_delete_that_fails_when_it_finishes_should_keep_its_segments_que
     );
     assert_eq!(queued(&partition), [0_u64; 0]);
     assert!(store(&deleter).inner.is_empty());
+}
+
+/// The next primary starts without the queue and finds a segment only by its
+/// `.log` object, so a delete that got through half of a segment has to leave
+/// that one.
+#[compio::test]
+async fn given_a_refused_index_delete_when_primacy_moves_should_leave_the_log_for_the_next_primary_to_finish()
+ {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let deleter = deleter();
+    upload_sealed(&mut partition, store(&deleter)).await;
+    truncate(&mut partition, SEALED[1].1).await;
+    let committed = SEALED[1].1;
+    pass(&mut partition, &deleter, IggyTimestamp::now(), committed).await;
+
+    let refused = key_of(PREFIX, SEALED[1].0, SegmentObject::Index);
+    store(&deleter).deletes.replace(Deletes::RefuseKey(refused));
+    assert_eq!(
+        pass(&mut partition, &deleter, past_the_grace_period(), committed).await,
+        Some(delete_of(&[SEALED[0].0, SEALED[1].0]))
+    );
+    assert_eq!(store(&deleter).inner.keys(), keys_of(SEALED[1].0));
+
+    regain_primacy(&mut partition);
+    store(&deleter).deletes.replace(Deletes::Work);
+    assert_eq!(
+        pass(&mut partition, &deleter, IggyTimestamp::now(), committed).await,
+        Some(sweep_of(&partition, committed))
+    );
+    assert_eq!(
+        pass(&mut partition, &deleter, past_the_grace_period(), committed).await,
+        Some(delete_of(&[SEALED[1].0]))
+    );
+    assert!(store(&deleter).inner.is_empty());
+}
+
+/// Every `.index` goes before any `.log`, and a segment whose `.index` the
+/// store kept is not asked for its `.log`.
+#[compio::test]
+async fn given_segments_to_delete_when_deleting_should_send_every_index_before_the_logs_of_the_deleted_ones()
+ {
+    let store = Faulty::default();
+    for start_offset in [0, 10, 20] {
+        for key in keys_of(start_offset) {
+            put(&store, &key).await;
+        }
+    }
+    store
+        .deletes
+        .replace(Deletes::RefuseKey(key_of(PREFIX, 10, SegmentObject::Index)));
+
+    assert_eq!(
+        delete_segments(&store, &layout(), &PREFIX, &[0, 10, 20]).await,
+        [10]
+    );
+
+    assert_eq!(store.inner.keys(), keys_of(10));
+    assert_eq!(store.delete_calls.take(), [3, 2]);
+
+    // A store that takes no call is not asked for a single `.log`.
+    store.deletes.replace(Deletes::FailFromCall(0));
+    assert_eq!(
+        delete_segments(&store, &layout(), &PREFIX, &[10, 20]).await,
+        [10, 20]
+    );
+    assert_eq!(store.delete_calls.take(), [2]);
 }
 
 #[compio::test]
@@ -1381,7 +1449,7 @@ async fn given_a_listing_that_fails_when_an_incarnation_is_deleted_should_delete
 async fn given_more_objects_than_one_page_when_deleting_an_incarnation_should_follow_every_page_in_bounded_calls()
  {
     let store = Faulty::default();
-    let segments = MAX_KEYS_PER_REQUEST as u64 / 2 + 100;
+    let segments = MAX_KEYS_PER_REQUEST as u64 + 100;
     let start_offsets: Vec<u64> = (0..segments).map(|segment| segment * 10).collect();
     store_incarnation(&store, PREFIX, &start_offsets).await;
 
@@ -1393,11 +1461,14 @@ async fn given_more_objects_than_one_page_when_deleting_an_incarnation_should_fo
     );
 
     assert!(store.inner.is_empty());
-    // Two calls for the segments, then one for the manifest.
-    assert_eq!(store.delete_calls.take(), [MAX_KEYS_PER_REQUEST, 200, 1]);
+    // The `.index` and then the `.log` objects of a full call of segments,
+    // the same for the rest, then the manifest.
+    assert_eq!(
+        store.delete_calls.take(),
+        [MAX_KEYS_PER_REQUEST, MAX_KEYS_PER_REQUEST, 100, 100, 1]
+    );
 
-    // The first call fails, so the second is not sent and the manifest
-    // stays.
+    // The first call fails, so no other is sent and the manifest stays.
     store_incarnation(&store, PREFIX, &start_offsets).await;
     store.deletes.replace(Deletes::FailFromCall(0));
     assert_eq!(

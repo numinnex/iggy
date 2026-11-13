@@ -25,14 +25,15 @@
 //! The segments that wait are kept in memory. A primary that starts without
 //! them lists its incarnation's objects once and takes up the ones that
 //! [`sweepable`] allows and whose `.log` object records an end at or below
-//! the same bound.
+//! the same bound. The `.log` object is therefore the last of a segment to
+//! go: [`delete_segments`] deletes it only after the segment's `.index`.
 //!
 //! A partition that a committed delete removed has no primary left, so
 //! [`DeletedIncarnations`] holds its incarnation for the node that saw the
 //! delete commit, and [`delete_incarnation`] removes everything the
 //! incarnation stored.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -58,8 +59,9 @@ pub const INCARNATION_DELETE_RETRY: Duration = Duration::from_mins(1);
 /// rest in the store.
 pub const MAX_QUEUED_INCARNATIONS: usize = 65_536;
 
-/// The most segments whose two objects fit one delete call to the store.
-const SEGMENTS_PER_DELETE_CALL: usize = MAX_KEYS_PER_REQUEST / SegmentObject::ALL.len();
+/// The most segments whose objects of one kind fit one delete call to the
+/// store.
+const SEGMENTS_PER_DELETE_CALL: usize = MAX_KEYS_PER_REQUEST;
 
 /// What one job does in the store for a partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,8 +75,8 @@ pub enum ObjectDeleteWork {
         /// The last offset a segment may hold for its objects to be deleted.
         bound: u64,
     },
-    /// Delete the `.log` and the `.index` of the segments that start at
-    /// these offsets.
+    /// Delete the `.index` and then the `.log` of the segments that start
+    /// at these offsets.
     Delete { start_offsets: Vec<u64> },
     /// Delete every segment object and the manifest of the incarnation,
     /// which a committed delete removed.
@@ -217,31 +219,57 @@ pub async fn delete_objects<S: ObjectStore>(store: &S, keys: &[String]) -> Vec<S
 /// Delete both objects of every segment of `prefix` that starts at one of
 /// `start_offsets`, and return the first offsets of the segments that still
 /// have an object.
+///
+/// Every `.index` is deleted before any `.log`, and a segment keeps its
+/// `.log` while its `.index` is not deleted. A sweep finds a segment by its
+/// `.log` object alone, so a segment that lost only that one would keep its
+/// `.index` for as long as the incarnation lives.
 pub async fn delete_segments<S: ObjectStore>(
     store: &S,
     layout: &KeyLayout,
     prefix: &ObjectPrefix,
     start_offsets: &[u64],
 ) -> Vec<u64> {
+    let mut failed =
+        delete_segment_objects(store, layout, prefix, start_offsets, SegmentObject::Index).await;
+    let without_index: Vec<u64> = start_offsets
+        .iter()
+        .copied()
+        .filter(|start_offset| !failed.contains(start_offset))
+        .collect();
+    failed.extend(
+        delete_segment_objects(store, layout, prefix, &without_index, SegmentObject::Log).await,
+    );
+    failed.into_iter().collect()
+}
+
+/// Delete the `object` of every segment of `prefix` that starts at one of
+/// `start_offsets`, and return the first offsets of the segments that still
+/// have it.
+async fn delete_segment_objects<S: ObjectStore>(
+    store: &S,
+    layout: &KeyLayout,
+    prefix: &ObjectPrefix,
+    start_offsets: &[u64],
+    object: SegmentObject,
+) -> BTreeSet<u64> {
     let keys: Vec<String> = start_offsets
         .iter()
-        .flat_map(|start_offset| {
-            SegmentObject::ALL.map(|object| {
-                layout.segment_key(&SegmentKey {
-                    prefix: *prefix,
-                    start_offset: *start_offset,
-                    object,
-                })
+        .map(|start_offset| {
+            layout.segment_key(&SegmentKey {
+                prefix: *prefix,
+                start_offset: *start_offset,
+                object,
             })
         })
         .collect();
-    let failed: BTreeSet<u64> = delete_objects(store, &keys)
-        .await
+    let failed: HashSet<String> = delete_objects(store, &keys).await.into_iter().collect();
+    start_offsets
         .iter()
-        .filter_map(|key| layout.parse_segment_key(key))
-        .map(|key| key.start_offset)
-        .collect();
-    failed.into_iter().collect()
+        .zip(&keys)
+        .filter(|(_, key)| failed.contains(*key))
+        .map(|(start_offset, _)| *start_offset)
+        .collect()
 }
 
 /// The first offset of every segment object the store lists for `prefix`.
@@ -476,12 +504,13 @@ impl RetiredSegments {
     }
 
     /// The queued segments whose grace period ended by `now`, that end at or
-    /// below `bound`, and that the partition does not list at `segment_starts`.
+    /// below `bound`, and whose first offset `is_segment_start` does not take
+    /// for a segment the partition lists.
     pub fn due(
         &self,
         now: IggyTimestamp,
         bound: u64,
-        segment_starts: &[u64],
+        is_segment_start: impl Fn(u64) -> bool,
     ) -> Vec<(u64, RetiredSegment)> {
         let grace = u64::try_from(RETIRED_OBJECT_GRACE.as_micros()).unwrap_or(u64::MAX);
         self.by_start
@@ -489,7 +518,7 @@ impl RetiredSegments {
             .filter(|(start_offset, retired)| {
                 now.as_micros() >= retired.retired_at.saturating_add(grace)
                     && retired.end_offset <= bound
-                    && segment_starts.binary_search(start_offset).is_err()
+                    && !is_segment_start(**start_offset)
             })
             .map(|(start_offset, retired)| (*start_offset, *retired))
             .collect()
@@ -499,6 +528,7 @@ impl RetiredSegments {
     /// `failed` stays, and so does one that was queued again while the delete
     /// ran, since its objects may have been stored after it.
     pub fn settle(&mut self, sent: &[(u64, RetiredSegment)], failed: &[u64]) {
+        let failed: HashSet<u64> = failed.iter().copied().collect();
         for (start_offset, retired) in sent {
             if !failed.contains(start_offset) && self.by_start.get(start_offset) == Some(retired) {
                 self.by_start.remove(start_offset);
@@ -508,6 +538,10 @@ impl RetiredSegments {
 
     pub fn len(&self) -> usize {
         self.by_start.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_start.is_empty()
     }
 
     #[cfg(test)]
@@ -783,11 +817,17 @@ mod tests {
         let mut retired = RetiredSegments::default();
         retired.retire(0, 9, at(1_000));
 
-        assert_eq!(retired.due(at(1_000 + grace() - 1), 9, &[10]), []);
-        assert_eq!(retired.due(at(1_000 + grace()), 8, &[10]), []);
-        assert_eq!(retired.due(at(1_000 + grace()), 9, &[0, 10]), []);
         assert_eq!(
-            retired.due(at(1_000 + grace()), 9, &[10]),
+            retired.due(at(1_000 + grace() - 1), 9, |start| start == 10),
+            []
+        );
+        assert_eq!(retired.due(at(1_000 + grace()), 8, |start| start == 10), []);
+        assert_eq!(
+            retired.due(at(1_000 + grace()), 9, |start| [0, 10].contains(&start)),
+            []
+        );
+        assert_eq!(
+            retired.due(at(1_000 + grace()), 9, |start| start == 10),
             [(
                 0,
                 RetiredSegment {
@@ -805,8 +845,8 @@ mod tests {
         retired.retire(0, 9, at(5_000));
         retired.retire(0, 9, at(2_000));
 
-        assert_eq!(retired.due(at(5_000 + grace() - 1), 9, &[]), []);
-        assert_eq!(retired.due(at(5_000 + grace()), 9, &[]).len(), 1);
+        assert_eq!(retired.due(at(5_000 + grace() - 1), 9, |_| false), []);
+        assert_eq!(retired.due(at(5_000 + grace()), 9, |_| false).len(), 1);
     }
 
     #[test]
@@ -815,7 +855,7 @@ mod tests {
         retired.retire(0, 9, at(1_000));
         retired.retire_swept(0, 9, at(5_000));
 
-        assert_eq!(retired.due(at(1_000 + grace()), 9, &[]).len(), 1);
+        assert_eq!(retired.due(at(1_000 + grace()), 9, |_| false).len(), 1);
     }
 
     #[test]
@@ -824,7 +864,7 @@ mod tests {
         for start_offset in [0, 10, 20] {
             retired.retire(start_offset, start_offset + 9, at(1_000));
         }
-        let sent = retired.due(at(1_000 + grace()), u64::MAX, &[]);
+        let sent = retired.due(at(1_000 + grace()), u64::MAX, |_| false);
         assert_eq!(sent.len(), 3);
         // The segment at 20 was queued again while the delete ran.
         retired.retire(20, 29, at(9_000));

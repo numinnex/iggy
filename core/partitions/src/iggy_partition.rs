@@ -13471,13 +13471,17 @@ where
         }
         let prefix = self.object_prefix()?;
         let bound = self.object_delete_bound(committed_up_to)?;
-        let segment_starts = self.segment_start_offsets();
         let deletes = self.object_deletes_of_this_view();
-        if deletes.running.is_some() {
+        if deletes.running.is_some() || (deletes.swept && deletes.retired.is_empty()) {
             return None;
         }
-        let (work, running) = if deletes.swept {
-            let due = deletes.retired.due(now, bound, &segment_starts);
+        let (work, running) = if self.object_deletes.swept {
+            let segments = self.log.segments();
+            let due = self.object_deletes.retired.due(now, bound, |start_offset| {
+                segments
+                    .binary_search_by_key(&start_offset, |segment| segment.start_offset)
+                    .is_ok()
+            });
             if due.is_empty() {
                 return None;
             }
@@ -13489,7 +13493,7 @@ where
         } else {
             (
                 crate::ObjectDeleteWork::Sweep {
-                    segment_starts,
+                    segment_starts: self.segment_start_offsets(),
                     bound,
                 },
                 RunningObjectDelete::Sweep { committed_up_to },
