@@ -132,12 +132,15 @@ pub fn stage_owned_partitions(
             // Retention of a tiered topic covers its remote segments too, so
             // no replica expires its own: the partition primary decides, and
             // the decision reaches every replica as a committed truncation.
-            if has_expiry || budget.is_some() {
-                let committed_up_to = streams
-                    .with_committed_partition(namespace, |partition| partition.deleted_up_to_offset)
-                    .unwrap_or_default();
+            if (has_expiry || budget.is_some())
+                && let Some((created_revision, committed_up_to)) = streams
+                    .with_committed_partition(namespace, |partition| {
+                        (partition.created_revision, partition.deleted_up_to_offset)
+                    })
+            {
                 shard.request_retain_partition(
                     namespace,
+                    created_revision,
                     now,
                     message_expiry,
                     budget.map(|budget| budget.max_bytes),

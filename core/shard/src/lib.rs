@@ -1161,6 +1161,10 @@ pub enum LifecycleFrame {
     /// that commits nothing new is dropped on the pump.
     RetainPartition {
         namespace: IggyNamespace,
+        /// The incarnation the policy was read for. Slab ids are reused after
+        /// a delete, so by the time the pump takes the frame the namespace
+        /// can name a recreated partition with another policy.
+        created_revision: u64,
         now: IggyTimestamp,
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
@@ -3509,12 +3513,14 @@ where
     }
 
     /// Stage a retention pass for `namespace`, a partition of a tiered topic,
-    /// on this shard's pump. `committed_up_to` is the truncation watermark
-    /// metadata already holds. A refused frame is picked up by the cleaner's
+    /// on this shard's pump. `created_revision` is the incarnation the policy
+    /// belongs to, and `committed_up_to` the truncation watermark metadata
+    /// already holds for it. A refused frame is picked up by the cleaner's
     /// next tick.
     pub fn request_retain_partition(
         &self,
         namespace: IggyNamespace,
+        created_revision: u64,
         now: IggyTimestamp,
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
@@ -3525,6 +3531,7 @@ where
         };
         let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::RetainPartition {
             namespace,
+            created_revision,
             now,
             message_expiry,
             max_bytes,
@@ -3533,28 +3540,31 @@ where
     }
 
     /// Run a retention pass over `namespace` on the pump: when its partition
-    /// is a tiered primary whose retention removes segments past
-    /// `committed_up_to`, hand the offset to shard 0 to commit.
+    /// is the incarnation `created_revision` and a tiered primary whose
+    /// retention removes segments past `committed_up_to`, hand the offset to
+    /// shard 0 to commit.
     pub(crate) fn on_retain_partition(
         &self,
         namespace: IggyNamespace,
+        created_revision: u64,
         now: IggyTimestamp,
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
         committed_up_to: u64,
     ) {
+        // The policy and the watermark belong to `created_revision`. Judged
+        // against any other incarnation they would truncate a topic that
+        // never had this policy.
         let decision = self
             .plane
             .partitions()
             .get_by_ns(&namespace)
-            .and_then(|partition| {
-                let up_to_offset = partition.total_retention_end(now, message_expiry, max_bytes)?;
-                Some((partition.created_revision(), up_to_offset))
-            });
+            .filter(|partition| partition.created_revision() == created_revision)
+            .and_then(|partition| partition.total_retention_end(now, message_expiry, max_bytes));
         // The same decision comes back on every tick until the replicas
         // enforce it, and committing it again would only wake every
         // reconciler.
-        if let Some((created_revision, up_to_offset)) = decision
+        if let Some(up_to_offset) = decision
             && up_to_offset > committed_up_to
         {
             self.forward_metadata_submit(MetadataSubmit::RetentionTruncate {

@@ -5062,11 +5062,24 @@ mod tests {
                 match frame {
                     shard::ShardFrame::Lifecycle(shard::LifecycleFrame::RetainPartition {
                         namespace,
+                        created_revision,
                         message_expiry,
                         max_bytes,
                         committed_up_to,
                         ..
-                    }) => retention.push((namespace, message_expiry, max_bytes, committed_up_to)),
+                    }) => {
+                        assert_eq!(
+                            Some(created_revision),
+                            shard
+                                .plane
+                                .metadata()
+                                .mux_stm
+                                .streams()
+                                .created_revision_for_namespace(namespace),
+                            "the pass names the incarnation its policy was read for"
+                        );
+                        retention.push((namespace, message_expiry, max_bytes, committed_up_to));
+                    }
                     shard::ShardFrame::Lifecycle(shard::LifecycleFrame::CleanPartition {
                         ..
                     }) => expiry_passes += 1,

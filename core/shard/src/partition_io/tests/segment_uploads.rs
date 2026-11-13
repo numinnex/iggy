@@ -822,6 +822,7 @@ async fn given_a_tiered_primary_over_budget_when_a_retention_pass_runs_should_ha
     let pass = |committed_up_to| {
         owner.on_retain_partition(
             namespace(),
+            created_revision,
             now,
             IggyExpiry::NeverExpire,
             Some(0),
@@ -846,9 +847,16 @@ async fn given_a_tiered_primary_over_budget_when_a_retention_pass_runs_should_ha
 async fn given_a_tiered_primary_within_its_policy_when_a_retention_pass_runs_should_send_nothing() {
     let directory = tempfile::tempdir().unwrap();
     let owner = Box::pin(sealed_owner(directory.path())).await;
+    let created_revision = owner
+        .plane
+        .partitions()
+        .get_by_ns(&namespace())
+        .unwrap()
+        .created_revision();
 
     owner.on_retain_partition(
         namespace(),
+        created_revision,
         IggyTimestamp::now(),
         IggyExpiry::NeverExpire,
         None,
@@ -856,6 +864,47 @@ async fn given_a_tiered_primary_within_its_policy_when_a_retention_pass_runs_sho
     );
 
     assert_eq!(retention_truncate(&owner), None);
+}
+
+/// The cleaner reads a policy for one incarnation, and the pump can take the
+/// frame after the topic was deleted and its slots were given to another.
+#[compio::test]
+async fn given_a_retention_pass_of_another_incarnation_when_it_runs_should_send_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(sealed_owner(directory.path())).await;
+    let now = IggyTimestamp::now();
+    let created_revision = owner
+        .plane
+        .partitions()
+        .get_by_ns(&namespace())
+        .unwrap()
+        .created_revision();
+    let pass = |staged_revision| {
+        owner.on_retain_partition(
+            namespace(),
+            staged_revision,
+            now,
+            IggyExpiry::NeverExpire,
+            Some(0),
+            0,
+        );
+        retention_truncate(&owner)
+    };
+
+    assert_eq!(pass(created_revision + 1), None);
+    assert_eq!(
+        pass(created_revision),
+        Some((created_revision, SEALED_SEGMENTS - 1))
+    );
+
+    // The partition the slots hold now is not the one the pass was staged for.
+    owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .set_created_revision(created_revision + 1);
+    assert_eq!(pass(created_revision), None);
 }
 
 /// The primary of the fixture after its first two segments were removed and

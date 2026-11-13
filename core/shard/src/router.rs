@@ -1184,6 +1184,7 @@ where
             }
             LifecycleFrame::RetainPartition {
                 namespace,
+                created_revision,
                 now,
                 message_expiry,
                 max_bytes,
@@ -1191,6 +1192,7 @@ where
             } => {
                 self.on_retain_partition(
                     namespace,
+                    created_revision,
                     now,
                     message_expiry,
                     max_bytes,
