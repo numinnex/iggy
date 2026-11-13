@@ -234,7 +234,9 @@ public struct TopicUpdateOptions: Sendable, Hashable {
     /// default.
     public var maxTopicSize: MaxTopicSize?
     /// `true` turns tiered storage on. Nil keeps it as it is, and `false` is
-    /// refused before anything is sent: an update never turns it off.
+    /// refused: an update never turns it off. The refusal comes before
+    /// anything is sent, or from the server when the patch carries ``raw``
+    /// keys or ``rawReset`` names.
     public var tieredStorage: Bool?
     /// Nil keeps the current local retention age.
     /// ``IggyExpiry/serverDefault`` changes nothing: reset
@@ -283,7 +285,9 @@ public struct TopicUpdateOptions: Sendable, Hashable {
             options[TopicOptionKey.maxTopicSize.rawValue] = .explicit(.uint64(maxTopicSize.wireValue))
         }
         if let tieredStorage {
-            guard tieredStorage else {
+            // A patch with a raw key or raw reset name is the server's to
+            // refuse, in its own order, so `false` is sent with it.
+            guard tieredStorage || !raw.isEmpty || !rawReset.isEmpty else {
                 throw IggyError(.optionNotUpdatable, context: TopicOptionKey.tieredStorage.rawValue)
             }
             options[TopicOptionKey.tieredStorage.rawValue] = .explicit(.bool(tieredStorage))

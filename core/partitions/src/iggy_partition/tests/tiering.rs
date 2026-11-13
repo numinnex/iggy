@@ -20,29 +20,69 @@ use super::segment_chain::PREFIX;
 use super::*;
 use crate::SegmentEviction;
 use crate::segment_chain::{
-    ChainRecord, HashSource, ObjectPrefix, chain_path, create_chain, hash_segment_file,
+    ChainRecord, HASH_STEP_LEN, HashSource, ObjectPrefix, chain_path, create_chain,
+    hash_segment_file,
 };
 
 /// A partition with [`RECEIVER_OPS`] one-message ops and no chain: two sealed
 /// segments and an active one that holds a message.
 async fn untiered_partition() -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+    Box::pin(untiered_partition_of(Bytes::from_static(b"abcdefgh"))).await
+}
+
+/// [`untiered_partition`] with `payload` in every message.
+async fn untiered_partition_of(
+    payload: Bytes,
+) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
     let config = repair_config();
     let (directory, mut partition) = Box::pin(disk_poll_partition_with_replicas(&config, 3)).await;
-    let batch_len = build_segment_record(partition.namespace(), 0).len() as u64;
-    let segment_size = IggyByteSize::from(BATCHES_PER_SEGMENT * batch_len);
+    let record = build_segment_record_with_payload(partition.namespace(), 0, payload);
+    let segment_size = IggyByteSize::from(BATCHES_PER_SEGMENT * record.len() as u64);
     partition.runtime_options.segment_size = Some(segment_size);
     partition.log.active_segment_mut().max_size = segment_size;
     partition.set_io_notifier(
         Rc::new(|_, _| {}),
         crate::largest_legal_job_charge().unwrap(),
     );
-    Box::pin(commit_records(
-        &mut partition,
-        1,
-        &segment_records(RECEIVER_OPS),
-    ))
-    .await;
+    let records: Vec<_> = (0..RECEIVER_OPS).map(|_| record.clone()).collect();
+    Box::pin(commit_records(&mut partition, 1, &records)).await;
     (directory, partition)
+}
+
+/// A payload that makes every sealed segment of [`untiered_partition_of`]
+/// longer than one hash step and shorter than two.
+fn two_step_payload() -> Bytes {
+    Bytes::from(vec![7; HASH_STEP_LEN * 3 / 4])
+}
+
+/// Runs the lane until it plans a tiering job, `None` when it goes idle
+/// without one.
+async fn next_tiering_plan(
+    partition: &mut IggyPartition<IggyMessageBus>,
+) -> Option<crate::PartitionIoPlan> {
+    let config = repair_config();
+    loop {
+        match partition.resume_io(&config).await {
+            crate::PartitionIoStep::Ready(plan)
+                if plan.continuation == crate::PartitionIoContinuation::Tiering =>
+            {
+                return Some(plan);
+            }
+            crate::PartitionIoStep::Ready(plan) => {
+                Box::pin(execute_partition_io_plan(partition, &config, plan)).await;
+            }
+            crate::PartitionIoStep::Progress => {}
+            crate::PartitionIoStep::Pending => return None,
+            _ => panic!("unexpected partition I/O continuation"),
+        }
+    }
+}
+
+/// Runs the next tiering job, which the test expects to exist.
+async fn run_tiering_job(partition: &mut IggyPartition<IggyMessageBus>) -> crate::PartitionIoPlan {
+    let plan = Box::pin(next_tiering_plan(partition)).await.unwrap();
+    Box::pin(execute_partition_io_plan(partition, &repair_config(), plan)).await;
+    plan
 }
 
 async fn enable(partition: &mut IggyPartition<IggyMessageBus>, prefix: ObjectPrefix) {
@@ -172,4 +212,155 @@ async fn given_a_chain_of_another_incarnation_when_tiering_is_enabled_should_sta
     assert_eq!(chain_records(directory.path()).await, Vec::new());
     // The request is dropped, so the lane does not ask again on every pass.
     Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+}
+
+#[compio::test]
+async fn given_a_sealed_segment_when_its_hash_is_planned_should_reserve_the_read_buffer() {
+    let (_directory, mut partition) = Box::pin(untiered_partition()).await;
+    partition.enable_tiering(PREFIX);
+    let open = Box::pin(run_tiering_job(&mut partition)).await;
+    assert!(partition.is_tiered());
+
+    let hash = Box::pin(next_tiering_plan(&mut partition)).await.unwrap();
+
+    let segment_len = usize::try_from(partition.log.segments()[0].size.as_bytes_u64()).unwrap();
+    assert_eq!(hash.allocation_charge, open.allocation_charge + segment_len);
+}
+
+/// A hash from disk runs one step per job, and a commit that became ready
+/// behind a step runs before the next one.
+#[compio::test]
+async fn given_a_segment_longer_than_one_hash_step_when_a_commit_waits_should_persist_it_between_steps()
+ {
+    let (directory, mut partition) = Box::pin(untiered_partition_of(two_step_payload())).await;
+    partition.enable_tiering(PREFIX);
+    Box::pin(run_tiering_job(&mut partition)).await;
+
+    let step = Box::pin(run_tiering_job(&mut partition)).await;
+    let base = step.allocation_charge - HASH_STEP_LEN;
+    assert_eq!(
+        partition.sealed_segment_record(0),
+        None,
+        "one step leaves the segment's tail unread"
+    );
+
+    let record = build_segment_record(partition.namespace(), 0);
+    let op = RECEIVER_OPS + 1;
+    journal_send_record(&mut partition, op, &record).await;
+    partition.consensus().advance_commit_max(op);
+    assert!(
+        matches!(
+            partition.resume_io(&repair_config()).await,
+            crate::PartitionIoStep::Progress
+        ),
+        "the commit is selected before the next hash step"
+    );
+    let tail = Box::pin(next_tiering_plan(&mut partition)).await.unwrap();
+    assert_eq!(partition.consensus().commit_min(), op);
+    let segment_len = usize::try_from(partition.log.segments()[0].size.as_bytes_u64()).unwrap();
+    assert_eq!(tail.allocation_charge, base + segment_len - HASH_STEP_LEN);
+
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+    assert_eq!(partition.pending_tiering(), None);
+    assert_eq!(
+        Box::pin(recorded(directory.path())).await,
+        [(0, HashSource::Disk), (2, HashSource::Disk)]
+    );
+}
+
+#[compio::test]
+async fn given_a_segment_retention_removed_between_hash_steps_when_hashing_resumes_should_hash_the_next_segment_whole()
+ {
+    let (directory, mut partition) = Box::pin(untiered_partition_of(two_step_payload())).await;
+    partition.enable_tiering(PREFIX);
+    Box::pin(run_tiering_job(&mut partition)).await;
+    Box::pin(run_tiering_job(&mut partition)).await;
+    assert_eq!(partition.sealed_segment_record(0), None);
+
+    let first_end = partition.log.segments()[0].end_offset;
+    Box::pin(partition.remove_sealed_segments_up_to(first_end)).await;
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+
+    assert_eq!(partition.chain_trim_point(), Some(first_end));
+    assert_eq!(partition.pending_tiering(), None);
+    assert_eq!(
+        Box::pin(recorded(directory.path())).await,
+        [(first_end + 1, HashSource::Disk)]
+    );
+}
+
+#[compio::test]
+async fn given_a_hash_that_fails_when_its_delay_has_passed_should_retry_and_record_the_segment() {
+    let (directory, mut partition) = Box::pin(untiered_partition()).await;
+    let log = directory.path().join(format!("{:020}.log", 0));
+    let moved = directory.path().join("moved");
+    std::fs::rename(&log, &moved).unwrap();
+
+    Box::pin(enable(&mut partition, PREFIX)).await;
+
+    assert!(partition.is_tiered());
+    assert_eq!(partition.pending_tiering(), Some(PREFIX));
+    assert_eq!(chain_records(directory.path()).await, Vec::new());
+
+    std::fs::rename(&moved, &log).unwrap();
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+    assert_eq!(
+        chain_records(directory.path()).await,
+        Vec::new(),
+        "the retry waits for its delay"
+    );
+
+    partition
+        .maintenance
+        .tiering
+        .as_mut()
+        .unwrap()
+        .retry_after_micros = 0;
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+    assert_eq!(partition.pending_tiering(), None);
+    assert_eq!(
+        Box::pin(recorded(directory.path())).await,
+        [(0, HashSource::Disk), (2, HashSource::Disk)]
+    );
+}
+
+#[compio::test]
+async fn given_sealed_segments_without_records_when_shutdown_begins_should_plan_no_hash() {
+    let (directory, mut partition) = Box::pin(untiered_partition()).await;
+    partition.enable_tiering(PREFIX);
+    Box::pin(run_tiering_job(&mut partition)).await;
+    assert!(partition.is_tiered());
+
+    partition.begin_shutdown_io();
+
+    assert!(Box::pin(next_tiering_plan(&mut partition)).await.is_none());
+    assert_eq!(partition.pending_tiering(), None);
+    assert_eq!(chain_records(directory.path()).await, Vec::new());
+}
+
+/// A request scans on from the segment it reached, and a later request
+/// starts at the front again.
+#[compio::test]
+async fn given_a_scan_past_a_segment_when_the_next_hash_is_picked_should_not_revisit_it() {
+    let (directory, mut partition) = Box::pin(untiered_partition()).await;
+    partition.enable_tiering(PREFIX);
+    Box::pin(run_tiering_job(&mut partition)).await;
+    Box::pin(next_tiering_plan(&mut partition)).await.unwrap();
+    let scan_from = |partition: &IggyPartition<IggyMessageBus>| {
+        partition.maintenance.tiering.as_ref().unwrap().scan_from
+    };
+    assert_eq!(scan_from(&partition), 0);
+    partition.maintenance.tiering.as_mut().unwrap().scan_from = 1;
+
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+    assert_eq!(
+        Box::pin(recorded(directory.path())).await,
+        [(2, HashSource::Disk)]
+    );
+
+    Box::pin(enable(&mut partition, PREFIX)).await;
+    assert_eq!(
+        Box::pin(recorded(directory.path())).await,
+        [(2, HashSource::Disk), (0, HashSource::Disk)]
+    );
 }

@@ -38,7 +38,9 @@ use crate::producer_state::{
 };
 use crate::segment::SegmentLocation;
 use crate::segment_anchor::ANCHOR_SUFFIX;
-use crate::segment_chain::{CHAIN_FILE, Chain, ChainRecord, ObjectPrefix, decode_chain};
+use crate::segment_chain::{
+    CHAIN_FILE, Chain, ChainRecord, LiveChain, ObjectPrefix, SegmentRecord, decode_chain,
+};
 use crate::state_machine::{
     SNAPSHOT_BYTES_MAX, SnapshotDecodeError, StateMachineError, StateMachineSnapshot,
 };
@@ -2334,7 +2336,7 @@ pub(crate) struct PendingInstall {
     partition_dir: String,
     staged: Vec<StagedSegmentMeta>,
     /// The sender's chain, which replaces this replica's.
-    chain: Option<Chain>,
+    chain: Option<TransferredChain>,
     offsets_wire: ConsumerOffsetsWire,
     /// The emptied-at op the installed table keeps, `0` for none.
     emptied_at: u64,
@@ -2357,6 +2359,19 @@ enum InstallDisposition {
     Prepared,
     Backup,
     Mutating,
+}
+
+/// The chain an offer carried, decoded and reduced once when the install was
+/// checked. A chain holds a record per segment the partition ever sealed and
+/// every install step runs on the shard thread, so no step walks it again to
+/// rebuild what an earlier one had.
+struct TransferredChain {
+    /// The file the sweep writes.
+    chain: Chain,
+    /// What the partition keeps of it once the install is published.
+    live: LiveChain,
+    /// The segments planted without bytes, in offset order.
+    remote: Vec<SegmentRecord>,
 }
 
 enum InstallPhase {
@@ -2845,10 +2860,15 @@ where
     ) -> Result<TransferPlan, PartitionTransferUnavailable> {
         let memos = self.segment_checksum_cache.borrow();
         let mut segments = Vec::with_capacity(self.log.segments().len());
+        let mut without_log = Vec::new();
         for (segment, storage) in self.log.segments().iter().zip(self.log.storages()) {
             let size = segment.size.as_bytes_u64();
             // A segment whose `.log` left the disk travels as its chain record.
-            if size == 0 || segment.location == SegmentLocation::Remote {
+            if segment.location == SegmentLocation::Remote {
+                without_log.push(segment.start_offset);
+                continue;
+            }
+            if size == 0 {
                 continue;
             }
             let (log_path, _) = storage.segment_and_index_paths();
@@ -2872,7 +2892,9 @@ where
         Ok(TransferPlan {
             commit_op: self.consensus().commit_min(),
             segments,
-            chain: self.segment_chain_snapshot(),
+            // The same pass decides which segments send bytes and which the
+            // chain marks remote, so the two never name one segment twice.
+            chain: self.segment_chain_snapshot(&without_log),
             offsets: self.offsets_wire_snapshot()?,
         })
     }
@@ -3595,8 +3617,12 @@ where
             | InstallPhase::DiscardOffsets(_)
             | InstallPhase::CommitOffsets(_) => base.checked_mul(OFFSET_PERSIST_CONCURRENCY),
             InstallPhase::Sweep => pending.staged.iter().try_fold(
-                base.checked_add(SEGMENT_SWEEP_STACK_BYTES)?
-                    .checked_add(pending.chain.as_ref().map_or(0, Chain::encoded_len))?,
+                base.checked_add(SEGMENT_SWEEP_STACK_BYTES)?.checked_add(
+                    pending
+                        .chain
+                        .as_ref()
+                        .map_or(0, |transferred| transferred.chain.encoded_len()),
+                )?,
                 |charge, segment| {
                     charge
                         .checked_add(segment.log_staging.capacity())?
@@ -3613,6 +3639,7 @@ where
                 base.checked_add(self.offset_cleanup_charge(kind)?)?
                     .checked_add(retained.checked_mul(size_of::<u32>())?)
             }
+            InstallPhase::Backup => base.checked_add(crate::install_backup::COPY_BUFFER_BYTES),
             InstallPhase::RetryCheckpoint => base.checked_add(pending.retry_checkpoint.capacity()),
             InstallPhase::Converge => ConsumerKind::ALL.into_iter().try_fold(
                 base.checked_add(size_of::<[HashSet<u32>; ConsumerKind::COUNT]>())?,
@@ -3979,7 +4006,10 @@ where
                         .flat_map(|meta| [meta.log_staging.clone(), meta.index_staging.clone()])
                         .collect(),
                     bodies: self.persistence.is_some(),
-                    chain: install.chain.as_ref().map(Chain::encode),
+                    chain: install
+                        .chain
+                        .as_ref()
+                        .map(|transferred| transferred.chain.encode()),
                 }),
                 InstallFilePhase::Sweep,
             ),
@@ -4503,10 +4533,23 @@ where
 
     /// Keep the transferred chain, and count every installed segment, the
     /// remote ones included.
-    fn publish_installed_segments(&mut self, install: &PendingInstall) {
+    fn publish_installed_segments(&mut self, install: &mut PendingInstall) {
         self.drop_segment_chain();
-        if let Some(chain) = install.chain.as_ref()
-            && let Err(error) = self.adopt_segment_chain(chain)
+        let (remote_size, remote_messages) = install.chain.as_ref().map_or((0, 0), |chain| {
+            chain
+                .remote
+                .iter()
+                .fold((0, 0), |(size, messages), segment| {
+                    (
+                        size + segment.size,
+                        messages + (segment.end_offset - segment.start_offset + 1),
+                    )
+                })
+        });
+        // No later step reads the chain, so the partition takes the reduced
+        // form instead of walking the records again.
+        if let Some(chain) = install.chain.take()
+            && let Err(error) = self.adopt_live_chain(chain.live)
         {
             // The chain was checked against this partition before the install
             // began, so only a programming error lands here.
@@ -4516,30 +4559,20 @@ where
                 "cannot keep the transferred segment chain"
             );
         }
-        let remote = install
-            .chain
-            .as_ref()
-            .map(Chain::remote_segments)
-            .unwrap_or_default();
         self.stats.zero_out_all();
         self.stats.increment_segments_count(
             u32::try_from(self.log.segments().len()).expect("manifest segment count fits u32"),
         );
         self.stats.increment_size_bytes(
-            install.staged.iter().map(|meta| meta.size).sum::<u64>()
-                + remote.iter().map(|segment| segment.size).sum::<u64>(),
+            install.staged.iter().map(|meta| meta.size).sum::<u64>() + remote_size,
         );
         self.stats.increment_messages_count(
             install
                 .staged
                 .iter()
                 .map(|meta| meta.end_offset - meta.start_offset + 1)
-                .chain(
-                    remote
-                        .iter()
-                        .map(|segment| segment.end_offset - segment.start_offset + 1),
-                )
-                .sum(),
+                .sum::<u64>()
+                + remote_messages,
         );
     }
 
@@ -4794,7 +4827,7 @@ where
         &self,
         bytes: &[u8],
         first_local: u64,
-    ) -> Result<Chain, PartitionInstallError> {
+    ) -> Result<TransferredChain, PartitionInstallError> {
         let chain = decode_chain(bytes)
             .ok()
             .filter(|chain| !chain.torn_tail)
@@ -4811,11 +4844,12 @@ where
                 recorded: chain.prefix,
             });
         }
-        let remote = chain.remote_segments();
+        let live = LiveChain::new(&chain);
+        let remote = live.remote_segments();
         let mut next_start = remote
             .first()
             .map_or(first_local, |first| first.start_offset);
-        if let Some(trim_point) = chain.trim_point()
+        if let Some(trim_point) = live.trim_point()
             && next_start > trim_point.saturating_add(1)
         {
             return Err(PartitionInstallError::ChainFrontAboveTrimPoint {
@@ -4838,14 +4872,18 @@ where
                 next_start: first_local,
             });
         }
-        Ok(chain)
+        Ok(TransferredChain {
+            chain,
+            live,
+            remote,
+        })
     }
 
     /// Put the chain's remote segments in front of the staged ones. No bytes
     /// of theirs crossed, and their indexes are fetched when a read needs them.
-    fn plant_transferred_remote_segments(&mut self, chain: Option<&Chain>) {
+    fn plant_transferred_remote_segments(&mut self, chain: Option<&TransferredChain>) {
         let max_size = self.effective_segment_size();
-        for record in chain.map(Chain::remote_segments).unwrap_or_default() {
+        for record in chain.map_or(&[][..], |transferred| transferred.remote.as_slice()) {
             self.log.add_persisted_segment(
                 record.remote_segment(max_size),
                 server_common::SegmentStorage::without_messages(None),
@@ -4991,7 +5029,7 @@ const INDEX_STRIDE_BYTES: usize = 64 * 1024;
 /// chunk) the yields would add over half the pass again; 4 MiB keeps the
 /// un-yielded stretch a bounded ~80 us CPU pass at ~15% overhead, and
 /// matches the recovery walk's `SCAN_WINDOW_CAPACITY`.
-const OFFER_HASH_CHUNK_LEN: usize = 4 << 20;
+pub(crate) const OFFER_HASH_CHUNK_LEN: usize = 4 << 20;
 
 /// Bytes one offer-build round may read and hash before it refuses and resumes
 /// on the next request.

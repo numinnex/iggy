@@ -28,12 +28,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// A sample alone is a second old, and a burst can write through the reserve
 /// in less. So the free space is the last sample minus what the disk usage
 /// estimate grew by since, which the write sites charge as they write.
+///
+/// A write is charged when it starts, and a partition accepts messages before
+/// that. So the free space also leaves out the pending bytes: accepted, and
+/// not written yet.
 #[derive(Debug)]
 pub struct FreeSpaceReserve {
     reserve_bytes: u64,
     usage: &'static DiskUsage,
-    sampled_free_bytes: AtomicU64,
-    sampled_used_bytes: AtomicU64,
+    /// Free plus used bytes of the last sample, or `u64::MAX` before the
+    /// first. One value, so a reader never pairs the free bytes of one sample
+    /// with the used bytes of another.
+    sampled_total_bytes: AtomicU64,
+    pending_bytes: AtomicU64,
     /// Whether the last sample was short, for the sampler to log a crossing
     /// once. Admission reads the estimate instead.
     sampled_short: AtomicBool,
@@ -56,21 +63,21 @@ impl FreeSpaceReserve {
         Self {
             reserve_bytes,
             usage,
-            sampled_free_bytes: AtomicU64::new(u64::MAX),
-            sampled_used_bytes: AtomicU64::new(0),
+            sampled_total_bytes: AtomicU64::new(u64::MAX),
+            pending_bytes: AtomicU64::new(0),
             sampled_short: AtomicBool::new(false),
             refused_requests: AtomicU64::new(0),
         }
     }
 
     /// Records a sample of the data disk: its free bytes, and the used bytes
-    /// the same measurement gave the estimate as its base.
+    /// that the same measurement re-based `usage` on.
     pub fn observe(&self, free_bytes: u64, used_bytes: u64) -> FreeSpaceChange {
-        // A reader between the two stores pairs the old free bytes with the
-        // new used bytes. Growth since the sample then reads as zero for an
-        // instant, which the next read corrects.
-        self.sampled_used_bytes.store(used_bytes, Ordering::Relaxed);
-        self.sampled_free_bytes.store(free_bytes, Ordering::Relaxed);
+        // `u64::MAX` stays the mark of no sample.
+        self.sampled_total_bytes.store(
+            free_bytes.saturating_add(used_bytes).min(u64::MAX - 1),
+            Ordering::Relaxed,
+        );
         let short = free_bytes < self.reserve_bytes;
         match (self.sampled_short.swap(short, Ordering::Relaxed), short) {
             (false, true) => FreeSpaceChange::FellShort,
@@ -85,14 +92,41 @@ impl FreeSpaceReserve {
         self.free_bytes() < self.reserve_bytes
     }
 
-    /// Whether a primary must refuse new messages now. Counts the refusal.
+    /// Admits `bytes` of new messages if the reserve still stands once they
+    /// are written, and counts them as pending.
+    ///
+    /// The bytes are added before the check, so partitions on different
+    /// shards cannot each see the same room and take it. The caller hands
+    /// them back with [`Self::release_pending`] once its WAL counts them.
     #[must_use]
-    pub fn refuses_messages(&self) -> bool {
-        let short = self.is_short();
-        if short {
-            self.refused_requests.fetch_add(1, Ordering::Relaxed);
+    pub fn admit(&self, bytes: u64) -> bool {
+        self.add_pending(bytes);
+        let admitted = !self.is_short();
+        if !admitted {
+            self.release_pending(bytes);
         }
-        short
+        admitted
+    }
+
+    /// Counts a send that a primary refused for the reserve.
+    pub fn count_refusal(&self) {
+        self.refused_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts bytes that are accepted and will be written to the data disk.
+    pub fn add_pending(&self, bytes: u64) {
+        self.pending_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Takes back what [`Self::add_pending`] or [`Self::admit`] counted, once
+    /// the bytes are written, dropped or counted elsewhere.
+    pub fn release_pending(&self, bytes: u64) {
+        self.pending_bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn pending_bytes(&self) -> u64 {
+        self.pending_bytes.load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -100,17 +134,23 @@ impl FreeSpaceReserve {
         self.reserve_bytes
     }
 
-    /// The last sample minus what was written since, or `u64::MAX` before the
-    /// first sample. Space freed since the sample shows with the next one.
+    /// The last sample minus what was written since and what is pending, or
+    /// `u64::MAX` before the first sample. Space freed since the sample shows
+    /// with the next one.
     #[must_use]
     pub fn free_bytes(&self) -> u64 {
-        let sampled_free = self.sampled_free_bytes.load(Ordering::Relaxed);
-        let sampled_used = self.sampled_used_bytes.load(Ordering::Relaxed);
-        let written_since = self
-            .usage
-            .used_bytes()
-            .map_or(0, |used| used.saturating_sub(sampled_used));
-        sampled_free.saturating_sub(written_since)
+        let sampled_total = self.sampled_total_bytes.load(Ordering::Relaxed);
+        if sampled_total == u64::MAX {
+            return u64::MAX;
+        }
+        // `observe` requires a re-based estimate, so this is before the
+        // first sample too.
+        let Some(used) = self.usage.used_bytes() else {
+            return u64::MAX;
+        };
+        sampled_total
+            .saturating_sub(used)
+            .saturating_sub(self.pending_bytes())
     }
 
     #[must_use]
@@ -122,6 +162,7 @@ impl FreeSpaceReserve {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     const RESERVE: u64 = 1024;
     const USED: u64 = 1 << 30;
@@ -131,8 +172,7 @@ mod tests {
         static USAGE: DiskUsage = DiskUsage::new();
         let reserve = FreeSpaceReserve::new(RESERVE, &USAGE);
 
-        assert!(!reserve.refuses_messages());
-        assert_eq!(reserve.refused_requests(), 0);
+        assert!(reserve.admit(1));
     }
 
     #[test]
@@ -142,18 +182,18 @@ mod tests {
         let reserve = FreeSpaceReserve::new(RESERVE, &USAGE);
 
         assert_eq!(reserve.observe(RESERVE, USED), FreeSpaceChange::Unchanged);
-        assert!(!reserve.refuses_messages());
+        assert!(!reserve.is_short());
         assert_eq!(
             reserve.observe(RESERVE - 1, USED),
             FreeSpaceChange::FellShort
         );
         assert_eq!(reserve.observe(0, USED), FreeSpaceChange::Unchanged);
-        assert!(reserve.refuses_messages());
-        assert!(reserve.refuses_messages());
-        assert_eq!(reserve.refused_requests(), 2);
+        assert!(!reserve.admit(0));
+        reserve.count_refusal();
+        assert_eq!(reserve.refused_requests(), 1);
         assert_eq!(reserve.observe(RESERVE, USED), FreeSpaceChange::Recovered);
-        assert!(!reserve.refuses_messages());
-        assert_eq!(reserve.refused_requests(), 2);
+        assert!(reserve.admit(0));
+        assert_eq!(reserve.refused_requests(), 1);
         assert_eq!(reserve.free_bytes(), RESERVE);
     }
 
@@ -169,10 +209,10 @@ mod tests {
 
         drop(USAGE.charge(100));
         assert_eq!(reserve.free_bytes(), RESERVE);
-        assert!(!reserve.refuses_messages());
+        assert!(!reserve.is_short());
         let in_flight = USAGE.charge(1);
         assert!(
-            reserve.refuses_messages(),
+            reserve.is_short(),
             "a write still in flight already takes its space"
         );
         drop(in_flight);
@@ -191,7 +231,56 @@ mod tests {
             reserve.observe(RESERVE + 100, USED),
             FreeSpaceChange::Recovered
         );
-        assert!(!reserve.refuses_messages());
+        assert!(!reserve.is_short());
+    }
+
+    /// Accepted messages wait in a WAL queue before their write is charged,
+    /// and every partition of the node has such a queue.
+    #[test]
+    fn given_accepted_bytes_not_written_yet_when_they_would_cross_the_reserve_should_refuse() {
+        static USAGE: DiskUsage = DiskUsage::new();
+        USAGE.rebase(|| Some(((), USED)));
+        let reserve = FreeSpaceReserve::new(RESERVE, &USAGE);
+        reserve.observe(RESERVE + 100, USED);
+
+        assert!(reserve.admit(60));
+        assert!(
+            !reserve.admit(41),
+            "the first send has not been written, and still takes its space"
+        );
+        assert_eq!(reserve.pending_bytes(), 60, "a refused send takes nothing");
+        assert!(reserve.admit(40));
+        assert_eq!(reserve.free_bytes(), RESERVE);
+
+        // Written: the charge takes over from the pending bytes.
+        drop(USAGE.charge(100));
+        reserve.release_pending(100);
+        assert_eq!(reserve.free_bytes(), RESERVE);
+        assert!(!reserve.admit(1));
+    }
+
+    /// Both samples are short once the 200 bytes written since the first are
+    /// taken off. The free bytes of the first with the used bytes of the
+    /// second are not.
+    #[test]
+    fn given_a_sample_being_recorded_when_read_from_another_thread_should_never_mix_two_samples() {
+        static USAGE: DiskUsage = DiskUsage::new();
+        USAGE.rebase(|| Some(((), USED)));
+        drop(USAGE.charge(200));
+        let reserve = FreeSpaceReserve::new(RESERVE, &USAGE);
+        reserve.observe(RESERVE + 100, USED);
+
+        thread::scope(|scope| {
+            let sampler = scope.spawn(|| {
+                for _ in 0..2_000_000 {
+                    reserve.observe(RESERVE - 100, USED + 200);
+                    reserve.observe(RESERVE + 100, USED);
+                }
+            });
+            while !sampler.is_finished() {
+                assert_eq!(reserve.free_bytes(), RESERVE - 100);
+            }
+        });
     }
 
     #[test]
@@ -202,6 +291,6 @@ mod tests {
 
         assert_eq!(reserve.observe(0, USED), FreeSpaceChange::Unchanged);
         drop(USAGE.charge(RESERVE));
-        assert!(!reserve.refuses_messages());
+        assert!(reserve.admit(RESERVE));
     }
 }
