@@ -57,11 +57,13 @@ where
     }
 
     /// Stage a delete pass for `namespace` on this shard's pump.
-    /// `committed_up_to` is the truncation watermark metadata holds. A
-    /// refused frame is picked up by the cleaner's next tick.
+    /// `committed_up_to` is the truncation watermark metadata holds for the
+    /// incarnation `created_revision`. A refused frame is picked up by the
+    /// cleaner's next tick.
     pub fn request_delete_objects(
         &self,
         namespace: IggyNamespace,
+        created_revision: u64,
         now: IggyTimestamp,
         committed_up_to: u64,
     ) {
@@ -70,6 +72,7 @@ where
         };
         let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::DeleteObjects {
             namespace,
+            created_revision,
             now,
             committed_up_to,
         }));
@@ -78,6 +81,7 @@ where
     pub(crate) fn on_delete_objects(
         &self,
         namespace: IggyNamespace,
+        created_revision: u64,
         now: IggyTimestamp,
         committed_up_to: u64,
     ) {
@@ -98,10 +102,15 @@ where
         let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) else {
             return;
         };
+        // The watermark belongs to `created_revision`. Handed to any other
+        // incarnation it would let a sweep delete objects below an offset
+        // nothing committed as deleted there.
+        if partition.created_revision() != created_revision {
+            return;
+        }
         let Some((job, scope)) = partition.begin_object_delete(now, committed_up_to) else {
             return;
         };
-        let created_revision = partition.created_revision();
         let id = job.id;
         let undelivered = Rc::clone(&self.undelivered_object_deletes);
         // Through the bus, not the runtime directly: the simulator supplies

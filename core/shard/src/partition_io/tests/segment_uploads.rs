@@ -41,7 +41,7 @@ pub(super) fn namespace() -> IggyNamespace {
 
 /// The incarnation of the fixture's partition, which its passes are staged
 /// for.
-fn staged_revision(owner: &IoTestShard) -> u64 {
+pub(super) fn staged_revision(owner: &IoTestShard) -> u64 {
     owner
         .plane
         .partitions()

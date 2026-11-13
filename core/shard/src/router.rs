@@ -1218,10 +1218,11 @@ where
             }
             LifecycleFrame::DeleteObjects {
                 namespace,
+                created_revision,
                 now,
                 committed_up_to,
             } => {
-                self.on_delete_objects(namespace, now, committed_up_to);
+                self.on_delete_objects(namespace, created_revision, now, committed_up_to);
             }
             LifecycleFrame::ObjectDeleteFinished(finished) => {
                 self.on_object_delete_finished(*finished);

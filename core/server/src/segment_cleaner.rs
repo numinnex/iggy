@@ -137,7 +137,7 @@ pub fn stage_owned_partitions(
             tiered.push((namespace, created_revision, committed_up_to));
             // Staged whatever the topic's policy is: a truncation a client
             // asked for leaves objects behind as well.
-            shard.request_delete_objects(namespace, now, committed_up_to);
+            shard.request_delete_objects(namespace, created_revision, now, committed_up_to);
             // Retention of a tiered topic covers its remote segments too, so
             // no replica expires its own: the partition primary decides, and
             // the decision reaches every replica as a committed truncation.

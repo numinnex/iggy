@@ -17,7 +17,9 @@
 
 //! Delete passes on a shard that hosts a tiered primary on disk.
 
-use super::segment_uploads::{SEALED_SEGMENTS, floor, namespace, pumped, tiered_owner, until};
+use super::segment_uploads::{
+    SEALED_SEGMENTS, floor, namespace, pumped, staged_revision, tiered_owner, until,
+};
 use super::*;
 use crate::FinishedObjectDelete;
 use futures::future::LocalBoxFuture;
@@ -160,7 +162,7 @@ async fn finished_delete(owner: &IoTestShard) -> FinishedObjectDelete {
 /// Run one pass at `now` and settle the job it started.
 #[allow(clippy::future_not_send)]
 async fn settled_pass(owner: &IoTestShard, now: IggyTimestamp) {
-    owner.on_delete_objects(namespace(), now, TRUNCATED_UP_TO);
+    owner.on_delete_objects(namespace(), staged_revision(owner), now, TRUNCATED_UP_TO);
     let finished = finished_delete(owner).await;
     owner.on_object_delete_finished(finished);
 }
@@ -208,7 +210,12 @@ async fn given_uploaded_segments_a_truncation_removed_when_delete_passes_run_sho
 
     // The removal happened after `before`, so its grace period is not over.
     let inside = IggyTimestamp::from(after(before, 1).as_micros() - 1);
-    owner.on_delete_objects(namespace(), inside, TRUNCATED_UP_TO);
+    owner.on_delete_objects(
+        namespace(),
+        staged_revision(&owner),
+        inside,
+        TRUNCATED_UP_TO,
+    );
     assert_started(&owner, &deleter, 1).await;
     assert_eq!(store.len(), UPLOADED_OBJECTS);
 
@@ -218,7 +225,7 @@ async fn given_uploaded_segments_a_truncation_removed_when_delete_passes_run_sho
     assert_eq!(store.keys(), keys_of(&owner, 2));
 
     // Nothing is queued any more, so a pass starts no job.
-    owner.on_delete_objects(namespace(), later, TRUNCATED_UP_TO);
+    owner.on_delete_objects(namespace(), staged_revision(&owner), later, TRUNCATED_UP_TO);
     assert_started(&owner, &deleter, 2).await;
     assert_eq!(store.keys(), keys_of(&owner, 2));
 }
@@ -229,7 +236,12 @@ async fn given_no_deleter_when_a_delete_pass_runs_should_start_no_job() {
     let (owner, executor, deleter) = Box::pin(truncated_owner(directory.path())).await;
     owner.set_object_deleter(None);
 
-    owner.on_delete_objects(namespace(), IggyTimestamp::now(), TRUNCATED_UP_TO);
+    owner.on_delete_objects(
+        namespace(),
+        staged_revision(&owner),
+        IggyTimestamp::now(),
+        TRUNCATED_UP_TO,
+    );
 
     assert_started(&owner, &deleter, 0).await;
     // No job is in flight, so a pass with a deleter starts the first one.
@@ -237,6 +249,28 @@ async fn given_no_deleter_when_a_delete_pass_runs_should_start_no_job() {
     settled_pass(&owner, IggyTimestamp::now()).await;
     assert_eq!(deleter.started(), [sweep()]);
     assert_eq!(executor.0.store().len(), UPLOADED_OBJECTS);
+}
+
+/// Slab ids are reused, so a pass can reach a partition that took the place
+/// of the one its watermark was read for.
+#[compio::test]
+async fn given_a_delete_pass_of_another_incarnation_when_it_runs_should_start_no_job() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, _executor, deleter) = Box::pin(truncated_owner(directory.path())).await;
+    let stale_revision = staged_revision(&owner);
+    owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .set_created_revision(stale_revision + 1);
+    let now = IggyTimestamp::now();
+
+    owner.on_delete_objects(namespace(), stale_revision, now, TRUNCATED_UP_TO);
+    assert_started(&owner, &deleter, 0).await;
+
+    owner.on_delete_objects(namespace(), stale_revision + 1, now, TRUNCATED_UP_TO);
+    until(&owner, |_| deleter.started() == [sweep()]).await;
 }
 
 /// Slab ids are reused, so a result can arrive at a partition that took the
@@ -247,7 +281,7 @@ async fn given_a_result_of_another_incarnation_when_it_arrives_should_not_settle
     let (owner, _executor, deleter) = Box::pin(truncated_owner(directory.path())).await;
     deleter.hangs.set(true);
     let now = IggyTimestamp::now();
-    owner.on_delete_objects(namespace(), now, TRUNCATED_UP_TO);
+    owner.on_delete_objects(namespace(), staged_revision(&owner), now, TRUNCATED_UP_TO);
     until(&owner, |_| deleter.started() == [sweep()]).await;
     let created_revision = owner
         .plane
@@ -263,12 +297,22 @@ async fn given_a_result_of_another_incarnation_when_it_arrives_should_not_settle
     };
 
     owner.on_object_delete_finished(listed_nothing(created_revision + 1));
-    owner.on_delete_objects(namespace(), after(now, 2), TRUNCATED_UP_TO);
+    owner.on_delete_objects(
+        namespace(),
+        staged_revision(&owner),
+        after(now, 2),
+        TRUNCATED_UP_TO,
+    );
     // The job is still in flight.
     assert_started(&owner, &deleter, 1).await;
 
     owner.on_object_delete_finished(listed_nothing(created_revision));
-    owner.on_delete_objects(namespace(), after(now, 2), TRUNCATED_UP_TO);
+    owner.on_delete_objects(
+        namespace(),
+        staged_revision(&owner),
+        after(now, 2),
+        TRUNCATED_UP_TO,
+    );
     until(&owner, |_| deleter.started().len() == 2).await;
     assert_eq!(deleter.started()[1], delete_of(&[0, 1]));
 }
@@ -285,14 +329,19 @@ async fn given_a_full_inbox_when_a_job_finishes_should_settle_it_on_the_next_pas
     {}
     let now = IggyTimestamp::now();
 
-    owner.on_delete_objects(namespace(), now, TRUNCATED_UP_TO);
+    owner.on_delete_objects(namespace(), staged_revision(&owner), now, TRUNCATED_UP_TO);
     until(&owner, |owner| {
         !owner.undelivered_object_deletes.borrow().is_empty()
     })
     .await;
 
     // The pass settles the listing and starts the delete it allows.
-    owner.on_delete_objects(namespace(), after(now, 2), TRUNCATED_UP_TO);
+    owner.on_delete_objects(
+        namespace(),
+        staged_revision(&owner),
+        after(now, 2),
+        TRUNCATED_UP_TO,
+    );
     assert!(owner.undelivered_object_deletes.borrow().is_empty());
     until(&owner, |owner| {
         !owner.undelivered_object_deletes.borrow().is_empty()
@@ -302,7 +351,12 @@ async fn given_a_full_inbox_when_a_job_finishes_should_settle_it_on_the_next_pas
     assert_eq!(executor.0.store().keys(), keys_of(&owner, 2));
 
     // The delete's result waits the same way, and the next pass takes it.
-    owner.on_delete_objects(namespace(), after(now, 2), TRUNCATED_UP_TO);
+    owner.on_delete_objects(
+        namespace(),
+        staged_revision(&owner),
+        after(now, 2),
+        TRUNCATED_UP_TO,
+    );
     assert!(owner.undelivered_object_deletes.borrow().is_empty());
     compio::time::sleep(TASK_POLL_INTERVAL * 10).await;
     assert_eq!(deleter.started().len(), 2);

@@ -1220,6 +1220,10 @@ pub enum LifecycleFrame {
     /// a deleter.
     DeleteObjects {
         namespace: IggyNamespace,
+        /// The incarnation the pass was staged for, as on
+        /// [`Self::UploadSegments`]: `committed_up_to` bounds what a sweep
+        /// may delete, and says nothing about a recreated partition.
+        created_revision: u64,
         now: IggyTimestamp,
         committed_up_to: u64,
     },
