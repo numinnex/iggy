@@ -1519,6 +1519,12 @@ public final class PartitionReader implements AutoCloseable {
                 || ++partition.lastingRefusals >= LASTING_REFUSALS_BEFORE_STOP;
         ReadException failure = new ReadException(OptionalLong.of(partition.id), error, Optional.empty());
         if (stops) {
+            if (partition.gapFrom != null) {
+                // Only a seek reads the partition again, and it drops the gap and the batch read after it, which a
+                // seek to Next then skips. So the stop reports the gap as lost and queues that batch first.
+                loseGapBefore(partition, partition.gapEnd);
+                closeGap(partition);
+            }
             partition.stopped = failure;
             queue.addLast(new Entry(partition.id, partition.generation, null, failure));
             return;

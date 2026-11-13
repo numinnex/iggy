@@ -707,13 +707,16 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         // and the next batch rolls there again, replacing the name. A name above
         // it holds only the dropped suffix. Left in place, a replacement that
         // rolls elsewhere would cover it, and recovery refuses that overlap.
-        // Recovery also unlinks every name above the tail, so a crash that loses
-        // these unlinks needs no directory barrier.
+        // Recovery unlinks every name above the tail, so a crash that loses
+        // these unlinks is harmless only until a replacement moves the tail
+        // past them. The frontier publishing that replacement must sync the
+        // directory first.
         let parent = self.segment_directory()?.to_path_buf();
         for start_offset in dropped_segments.range((
             Bound::Excluded(cursor.position.next_offset),
             Bound::Unbounded,
         )) {
+            self.segment_links_dirty = true;
             self.remove_segment_name(&parent.join(format!("{start_offset:020}.log")))
                 .await?;
         }
@@ -899,12 +902,18 @@ impl SegmentState {
     /// recovered into the same segment, else the tail's or the checkpoint's,
     /// which cover the one segment that can open before the oldest record.
     ///
+    /// The checkpoint's own prepare is the exception. A reanchor or a transfer
+    /// that installs no body for it moves both cursors off its segment, and no
+    /// rewind lands on the checkpoint, so its stamp is never read and is zero.
+    ///
     /// # Errors
-    /// Returns an error for a body in a segment whose first batch is unknown.
+    /// Returns an error for a body above the checkpoint in a segment whose
+    /// first batch is unknown.
     pub(super) fn recovered_first_timestamp(
         &self,
         reference: SegmentReference,
         prepare: &[u8],
+        checkpoint_prepare: bool,
         previous: &mut Option<((u64, u64), u64)>,
     ) -> io::Result<u64> {
         if self.max_age.is_none() {
@@ -915,9 +924,12 @@ impl SegmentState {
             decode_batch(prepare)?.base_timestamp
         } else if let Some((_, first)) = previous.filter(|(segment, _)| *segment == key) {
             first
+        } else if let Some(first) = self.cursor_first_timestamp(reference) {
+            first
+        } else if checkpoint_prepare {
+            return Ok(0);
         } else {
-            self.cursor_first_timestamp(reference)
-                .ok_or_else(|| invalid("recovered segment body has no known first batch"))?
+            return Err(invalid("recovered segment body has no known first batch"));
         };
         *previous = Some((key, first));
         Ok(first)

@@ -1764,6 +1764,13 @@ func (r *PartitionReader) handleRefusalLocked(p *partition, err error, now time.
 	p.lastingRefusals++
 	if errors.Is(err, ierror.ErrHistoryUnavailable) || errors.Is(err, ierror.ErrInvalidSizeBytes) ||
 		errors.Is(err, ierror.ErrTieredReadFailed) || p.lastingRefusals >= lastingRefusalsBeforeStop {
+		if p.gapFrom != nil {
+			// Only a seek reads the partition again, and it drops the gap and
+			// the batch read after it, which a seek to Next then skips. So the
+			// stop reports the gap as lost and queues that batch first, as an
+			// empty read that ends the gap does.
+			r.acceptGapLocked(p, &iggcon.PolledMessage{}, p.gapEnd)
+		}
 		p.stopped = &ReadError{PartitionID: &p.id, Err: err}
 		r.queue = append(r.queue, entry{partition: int64(p.id), generation: p.generation, err: p.stopped})
 		return
