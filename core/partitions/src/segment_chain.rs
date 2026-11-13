@@ -33,6 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
+use std::path::Path;
 
 use compio::io::AsyncWriteAtExt;
 use consensus::state_artifact_checksum;
@@ -47,7 +48,9 @@ use tracing::warn;
 
 use crate::IggyPartition;
 use crate::segment::{Segment, SegmentLocation};
-use crate::state_transfer::{ChunkHasher, STAGING_SUFFIX, hash_segment_range};
+use crate::state_transfer::{
+    ChunkHasher, OFFER_HASH_CHUNK_LEN, STAGING_SUFFIX, fsync_dir, hash_segment_range,
+};
 use crate::tiered_floor::AdvanceTieredFloor;
 
 #[cfg(test)]
@@ -619,12 +622,105 @@ impl SegmentDigest {
     pub fn finalize(&self) -> SegmentHashes {
         self.hasher.finalize()
     }
+
+    /// Whether the digest holds the first bytes of the segment starting at
+    /// `start_offset` and not yet all `size` of them.
+    pub(crate) const fn resumes(&self, start_offset: u64, size: u64) -> bool {
+        self.start_offset == start_offset && self.hashed_len < size
+    }
+
+    /// Whether this is the digest `captured` was before a step of the same
+    /// segment's hash.
+    pub(crate) const fn continues(&self, captured: &Self) -> bool {
+        self.start_offset == captured.start_offset && self.hashed_len > captured.hashed_len
+    }
+
+    /// Bytes the next step of a hash from disk reads of a segment of `size`
+    /// bytes, which is the buffer the step allocates.
+    pub(crate) fn step_len(&self, size: u64) -> usize {
+        usize::try_from(size.saturating_sub(self.hashed_len))
+            .map_or(HASH_STEP_LEN, |left| left.min(HASH_STEP_LEN))
+    }
 }
 
 impl ChunkHasher for SegmentDigest {
     fn update(&mut self, bytes: &[u8]) {
         self.hasher.update(bytes);
         self.hashed_len += bytes.len() as u64;
+    }
+}
+
+/// A chain reduced to its trim point and the latest record of every segment
+/// the trim point has not retired. Building it walks every record, so a reader
+/// that needs it more than once keeps it.
+pub(crate) struct LiveChain {
+    prefix: ObjectPrefix,
+    valid_len: u64,
+    trim_point: Option<u64>,
+    sealed: BTreeMap<u64, SegmentRecord>,
+    /// The segments in `sealed` whose latest record is remote.
+    remote: BTreeSet<u64>,
+    /// The hash of every recorded floor advance, by its last offset.
+    advances: BTreeMap<u64, [u8; SEGMENT_HASH_SIZE]>,
+}
+
+impl LiveChain {
+    pub(crate) fn new(chain: &Chain) -> Self {
+        let trim_point = chain.trim_point();
+        let mut latest: Vec<(&SegmentRecord, bool)> = chain
+            .records
+            .iter()
+            .filter_map(|record| {
+                let segment = record.segment()?;
+                trim_point
+                    .is_none_or(|trim_point| segment.end_offset > trim_point)
+                    .then_some((segment, matches!(record, ChainRecord::Remote(_))))
+            })
+            .collect();
+        // Sorted and deduplicated up front, so both collections below are
+        // built in one linear pass instead of an insert per record. The sort
+        // is stable and the walk is reversed, so the record kept for a start
+        // offset is the last the chain holds for it.
+        latest.sort_by_key(|(segment, _)| segment.start_offset);
+        latest.reverse();
+        latest.dedup_by_key(|(segment, _)| segment.start_offset);
+        latest.reverse();
+        Self {
+            prefix: chain.prefix,
+            valid_len: chain.valid_len,
+            trim_point,
+            sealed: latest
+                .iter()
+                .map(|(segment, _)| (segment.start_offset, **segment))
+                .collect(),
+            remote: latest
+                .iter()
+                .filter(|(_, remote)| *remote)
+                .map(|(segment, _)| segment.start_offset)
+                .collect(),
+            advances: chain
+                .records
+                .iter()
+                .filter_map(|record| match record {
+                    ChainRecord::Advanced(advance) => Some((advance.up_to, advance.hash)),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) const fn trim_point(&self) -> Option<u64> {
+        self.trim_point
+    }
+
+    /// The segments whose latest record is remote, in offset order.
+    pub(crate) fn remote_segments(&self) -> Vec<SegmentRecord> {
+        let mut remote = self.remote.iter().peekable();
+        self.sealed
+            .iter()
+            .filter(|(start_offset, _)| remote.next_if_eq(start_offset).is_some())
+            .map(|(_, segment)| *segment)
+            .collect()
     }
 }
 
@@ -694,17 +790,25 @@ pub enum TieringJob {
     /// Record the front that retention had left before tiering was enabled,
     /// or a floor advance the replica applied.
     Append(ChainAppend),
-    /// Hash a sealed segment that has no record from its `.log`, and record
-    /// it. `append` holds the record with a zero hash.
+    /// Hash the next [`HASH_STEP_LEN`] bytes of a sealed segment that has no
+    /// record from its `.log`, and record the segment once `digest` holds all
+    /// of it. `append` holds the record with a zero hash.
     Hash {
         log_path: String,
         append: ChainAppend,
+        digest: Box<SegmentDigest>,
     },
 }
+
+/// Bytes one step of a hash from disk reads. A step is one job on the
+/// partition's I/O lane, so this bounds how long other work waits behind it.
+pub(crate) const HASH_STEP_LEN: usize = OFFER_HASH_CHUNK_LEN;
 
 pub enum TieringResult {
     Opened(Result<Chain, ChainError>),
     Appended(io::Result<ChainRecord>),
+    /// The digest after a step that left bytes of the segment unread.
+    Hashed(Box<SegmentDigest>),
 }
 
 impl TieringJob {
@@ -718,32 +822,50 @@ impl TieringJob {
             }
             Self::Hash {
                 log_path,
-                mut append,
-            } => TieringResult::Appended(
-                async {
-                    if let ChainRecord::Sealed(segment) = &mut append.record {
-                        let hashes = hash_segment_file(&log_path, segment.size).await?;
-                        segment.hash = hashes.blake3;
-                        segment.crc32c = hashes.crc32c;
-                    }
-                    append.execute().await.map(|()| append.record)
-                }
-                .await,
-            ),
+                append,
+                digest,
+            } => hash_step(&log_path, append, digest)
+                .await
+                .unwrap_or_else(|error| TieringResult::Appended(Err(error))),
         }
     }
+}
+
+async fn hash_step(
+    log_path: &str,
+    mut append: ChainAppend,
+    mut digest: Box<SegmentDigest>,
+) -> io::Result<TieringResult> {
+    let ChainRecord::Sealed(segment) = &mut append.record else {
+        return Err(io::Error::other(
+            "a hash from disk records a sealed segment",
+        ));
+    };
+    let from = digest.hashed_len;
+    let to = from + digest.step_len(segment.size) as u64;
+    hash_segment_range(log_path, from, to, &mut *digest, None).await?;
+    if !digest.covers(segment.start_offset, segment.size) {
+        return Ok(TieringResult::Hashed(digest));
+    }
+    let hashes = digest.finalize();
+    segment.hash = hashes.blake3;
+    segment.crc32c = hashes.crc32c;
+    append.execute().await?;
+    Ok(TieringResult::Appended(Ok(append.record)))
 }
 
 /// The chain in `directory`, created holding `prefix` when there is none.
 async fn open(directory: &str, prefix: ObjectPrefix) -> Result<Chain, ChainError> {
     if let Some(chain) = read_chain(directory).await? {
-        return if chain.prefix == prefix {
-            Ok(chain)
-        } else {
-            Err(ChainError::Prefix {
+        if chain.prefix != prefix {
+            return Err(ChainError::Prefix {
                 recorded: chain.prefix,
-            })
-        };
+            });
+        }
+        // The chain may be here by a rename no directory sync followed, and
+        // a record appended to a name a power loss takes back is lost.
+        fsync_dir(directory).await?;
+        return Ok(chain);
     }
     create_chain(directory, &prefix).await?;
     Ok(Chain {
@@ -778,6 +900,8 @@ pub enum EvictionFailure {
     Record,
     /// The record is durable, but the `.log` is still there.
     Unlink,
+    /// The `.log` is unlinked, but a power loss may bring it back.
+    Sync,
 }
 
 impl EvictionJob {
@@ -798,14 +922,7 @@ impl EvictionJob {
             };
         }
         let outcome = match &messages_path {
-            Some(path) => match compio::fs::remove_file(path).await {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => {
-                    warn!(%path, start_offset, %error, "cannot unlink the evicted segment's log");
-                    Err(EvictionFailure::Unlink)
-                }
-            },
+            Some(path) => unlink_log(path, start_offset).await,
             None => Ok(()),
         };
         EvictionResult {
@@ -816,39 +933,46 @@ impl EvictionJob {
     }
 }
 
-impl SegmentChain {
-    fn load(path: String, chain: &Chain, active: Option<&Segment>) -> Self {
-        let mut sealed = BTreeMap::new();
-        let mut remote = BTreeSet::new();
-        for (start_offset, record) in chain.live_segments() {
-            if matches!(record, ChainRecord::Remote(_)) {
-                remote.insert(start_offset);
-            }
-            if let Some(segment) = record.segment() {
-                sealed.insert(start_offset, *segment);
-            }
+/// Unlink an evicted segment's `.log` and sync its directory before the next
+/// eviction may start. Without the sync a power loss could bring this `.log`
+/// back while a later one stays gone, and boot refuses a local segment in
+/// front of a remote one.
+async fn unlink_log(path: &str, start_offset: u64) -> Result<(), EvictionFailure> {
+    match compio::fs::remove_file(path).await {
+        Ok(()) => {}
+        // Gone already, by an unlink no directory sync is known to cover.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(%path, start_offset, %error, "cannot unlink the evicted segment's log");
+            return Err(EvictionFailure::Unlink);
         }
+    }
+    let directory = Path::new(path)
+        .parent()
+        .and_then(Path::to_str)
+        .ok_or(EvictionFailure::Sync)?;
+    fsync_dir(directory).await.map_err(|error| {
+        warn!(%path, start_offset, %error, "cannot sync the directory after unlinking the evicted segment's log");
+        EvictionFailure::Sync
+    })
+}
+
+impl SegmentChain {
+    fn load(path: String, chain: LiveChain, active: Option<&Segment>) -> Self {
         let digest = active
             .filter(|active| active.size.as_bytes_u64() == 0)
             .map(|active| Box::new(SegmentDigest::new(active.start_offset)));
-        let advances: BTreeMap<_, _> = chain
-            .records
-            .iter()
-            .filter_map(|record| match record {
-                ChainRecord::Advanced(advance) => Some((advance.up_to, advance.hash)),
-                _ => None,
-            })
-            .collect();
+        let advances = chain.advances;
         let mut loaded = Self {
             path,
             prefix: chain.prefix,
             valid_len: chain.valid_len,
-            sealed,
-            remote,
+            sealed: chain.sealed,
+            remote: chain.remote,
             confirmed: BTreeSet::new(),
             advances: BTreeMap::new(),
             diverged: BTreeSet::new(),
-            trim_point: chain.trim_point(),
+            trim_point: chain.trim_point,
             digest,
         };
         for (up_to, hash) in advances {
@@ -985,11 +1109,20 @@ impl SegmentChain {
     /// record of every live segment, without the records a reader no longer
     /// needs. `applied` are the advances the partition applied, of which the
     /// chain may not hold the latest yet.
-    fn snapshot<'a>(&self, applied: impl Iterator<Item = &'a AdvanceTieredFloor>) -> Chain {
+    ///
+    /// A segment is remote only when `without_log`, ascending, holds its start
+    /// offset. The chain's own remote records do not decide it: an eviction cut
+    /// short after its record leaves the `.log` in place, and that segment
+    /// travels as bytes.
+    fn snapshot<'a>(
+        &self,
+        without_log: &[u64],
+        applied: impl Iterator<Item = &'a AdvanceTieredFloor>,
+    ) -> Chain {
         let mut records = Vec::with_capacity(self.sealed.len() + 1);
         records.extend(self.trim_point.map(ChainRecord::TrimPoint));
         records.extend(self.sealed.values().map(|segment| {
-            if self.remote.contains(&segment.start_offset) {
+            if without_log.binary_search(&segment.start_offset).is_ok() {
                 ChainRecord::Remote(*segment)
             } else {
                 ChainRecord::Sealed(*segment)
@@ -999,11 +1132,12 @@ impl SegmentChain {
         // about them here holds there. Without these it would never evict the
         // segments it received: the advances that covered them are below the
         // floor it starts from, and are not applied again. A remote segment
-        // needs none, since nothing is left to evict.
+        // needs none, since nothing is left to evict. Remote here is what the
+        // receiver holds no bytes of, as for the records above.
         records.extend(
             self.confirmed
                 .iter()
-                .filter(|start_offset| !self.remote.contains(start_offset))
+                .filter(|start_offset| without_log.binary_search(start_offset).is_err())
                 .filter_map(|start_offset| self.sealed.get(start_offset))
                 .map(|segment| {
                     ChainRecord::Advanced(AdvanceTieredFloor {
@@ -1072,6 +1206,15 @@ impl SegmentChain {
         })
     }
 
+    /// Whether the chain holds neither a record of `segment` nor a trim point
+    /// that retires it.
+    pub(crate) fn lacks_record(&self, segment: &Segment) -> bool {
+        !self.sealed.contains_key(&segment.start_offset)
+            && self
+                .trim_point
+                .is_none_or(|trim_point| segment.end_offset > trim_point)
+    }
+
     /// The record of `segment` hashed from disk, with the hash still to fill
     /// in, `None` when the chain already records the segment.
     pub(crate) fn hash_from_disk(
@@ -1079,11 +1222,7 @@ impl SegmentChain {
         segment: &Segment,
         incarnation: u64,
     ) -> Option<ChainAppend> {
-        if self.sealed.contains_key(&segment.start_offset)
-            || self
-                .trim_point
-                .is_some_and(|trim_point| segment.end_offset <= trim_point)
-        {
+        if !self.lacks_record(segment) {
             return None;
         }
         Some(self.append(ChainRecord::Sealed(SegmentRecord::new(
@@ -1178,6 +1317,11 @@ where
     /// [`ChainError::Prefix`] when the chain names another partition or
     /// incarnation.
     pub fn adopt_segment_chain(&mut self, chain: &Chain) -> Result<(), ChainError> {
+        self.adopt_live_chain(LiveChain::new(chain))
+    }
+
+    /// [`Self::adopt_segment_chain`] of a chain already reduced.
+    pub(crate) fn adopt_live_chain(&mut self, chain: LiveChain) -> Result<(), ChainError> {
         let directory = self
             .partition_dir
             .as_deref()
@@ -1212,13 +1356,16 @@ where
     /// and its sweep replaces or removes the file.
     pub(crate) fn drop_segment_chain(&mut self) {
         self.segment_chain = None;
+        self.restart_tiering();
     }
 
     /// What a state transfer carries of the chain, `None` without one.
-    pub(crate) fn segment_chain_snapshot(&self) -> Option<Chain> {
+    /// `without_log` holds the start offsets of the segments the same transfer
+    /// sends no bytes for, ascending.
+    pub(crate) fn segment_chain_snapshot(&self, without_log: &[u64]) -> Option<Chain> {
         self.segment_chain
             .as_ref()
-            .map(|chain| chain.snapshot(self.pending_advances.iter()))
+            .map(|chain| chain.snapshot(without_log, self.pending_advances.iter()))
     }
 
     /// The object prefix the chain records, `None` without a chain.

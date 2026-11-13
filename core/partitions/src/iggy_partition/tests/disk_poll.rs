@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::remote_segments::IndexFetchFence;
 
 /// Fail-closed disk read: an unreadable EARLIER segment must stop the walk
 /// (return `Faulted`) rather than skip forward and serve a LATER segment's
@@ -60,6 +61,7 @@ async fn read_disk_faults_closed_when_earlier_segment_unreadable() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         deadline: None,
         bytes_per_message: None,
@@ -142,6 +144,7 @@ async fn read_disk_serves_a_batch_wider_than_the_sized_chunk() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         deadline: None,
         bytes_per_message: Some(1),
@@ -235,6 +238,7 @@ async fn read_disk_faults_closed_when_earlier_segment_corrupt() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         deadline: None,
         bytes_per_message: None,
@@ -319,6 +323,7 @@ async fn read_disk_faults_closed_on_batch_checksum_mismatch() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         deadline: None,
         bytes_per_message: None,
@@ -364,6 +369,7 @@ fn file_less_plan(persisted: u64) -> DiskReadPlan {
         partition_dir: PartitionDirResolution::NoFiles,
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         deadline: None,
         bytes_per_message: None,
@@ -430,6 +436,7 @@ async fn read_disk_faults_closed_when_partition_dir_unresolvable() {
         partition_dir: PartitionDirResolution::Unresolvable,
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         deadline: None,
         bytes_per_message: None,
@@ -505,6 +512,7 @@ async fn read_disk_caches_and_reuses_sealed_segment_fd() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         deadline: None,
         bytes_per_message: None,
@@ -545,6 +553,7 @@ async fn read_disk_caches_and_reuses_sealed_segment_fd() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         deadline: None,
         bytes_per_message: None,
@@ -614,6 +623,7 @@ async fn read_disk_does_not_retain_fd_for_untracked_handle() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         deadline: None,
         bytes_per_message: None,
@@ -707,6 +717,7 @@ async fn read_disk_reloads_sealed_index_to_skip_scan() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         deadline: None,
         bytes_per_message: None,
@@ -815,6 +826,7 @@ async fn read_disk_resolves_oversized_index_without_materializing() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         deadline: None,
         bytes_per_message: None,
@@ -848,4 +860,17 @@ async fn read_disk_resolves_oversized_index_without_materializing() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn given_ordered_segments_when_locating_an_offset_should_pick_the_last_that_starts_at_or_below_it()
+{
+    let segments =
+        [10, 20, 30].map(|start_offset| Segment::new(start_offset, IggyByteSize::default()));
+
+    let located =
+        [0, 10, 19, 20, 29, 30, u64::MAX].map(|offset| segment_holding(&segments, offset));
+
+    assert_eq!(located, [0, 0, 0, 1, 1, 2, 2]);
+    assert_eq!(segment_holding(&[], 7), 0);
 }
