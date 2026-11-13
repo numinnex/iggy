@@ -47,35 +47,37 @@ const NANOS_PER_SEC: u128 = 1_000_000_000;
 pub struct TokenBucket {
     rate_per_sec: u64,
     capacity: u64,
-    tokens: u64,
+    /// Below zero after an upload larger than the bucket: the debt is repaid
+    /// at the rate before anything else is admitted.
+    tokens: i128,
     refilled_at: Instant,
 }
 
 impl TokenBucket {
-    pub const fn full(rate_per_sec: u64, capacity: u64, now: Instant) -> Self {
+    pub fn full(rate_per_sec: u64, capacity: u64, now: Instant) -> Self {
         Self {
             rate_per_sec,
             capacity,
-            tokens: capacity,
+            tokens: i128::from(capacity),
             refilled_at: now,
         }
     }
 
     /// Take the tokens of an upload of `bytes`, or none when the bucket holds
-    /// too few. An upload larger than the bucket costs the whole bucket, so
-    /// it is admitted once the bucket is full instead of never.
+    /// too few. An upload larger than the bucket is admitted once the bucket
+    /// is full instead of never, and leaves the bytes the bucket did not hold
+    /// as a debt, so every byte it sends counts against the rate.
     pub fn try_take(&mut self, bytes: u64, now: Instant) -> bool {
         self.refill(now);
-        let cost = bytes.min(self.capacity);
-        if self.tokens < cost {
+        if self.tokens < i128::from(bytes.min(self.capacity)) {
             return false;
         }
-        self.tokens -= cost;
+        self.tokens -= i128::from(bytes);
         true
     }
 
     #[cfg(test)]
-    pub fn tokens(&mut self, now: Instant) -> u64 {
+    pub fn tokens(&mut self, now: Instant) -> i128 {
         self.refill(now);
         self.tokens
     }
@@ -86,16 +88,17 @@ impl TokenBucket {
         if earned == 0 {
             return;
         }
-        let tokens = u128::from(self.tokens) + earned;
-        if tokens >= u128::from(self.capacity) {
-            self.tokens = self.capacity;
+        let earned = i128::try_from(earned).unwrap_or(i128::MAX);
+        let tokens = self.tokens.saturating_add(earned);
+        if tokens >= i128::from(self.capacity) {
+            self.tokens = i128::from(self.capacity);
             self.refilled_at = now;
             return;
         }
         // Only the time that the whole tokens cost leaves the clock, so calls
         // closer together than one token do not starve the bucket.
-        let paid = earned * NANOS_PER_SEC / u128::from(self.rate_per_sec);
-        self.tokens = u64::try_from(tokens).unwrap_or(self.capacity);
+        let paid = earned.unsigned_abs() * NANOS_PER_SEC / u128::from(self.rate_per_sec);
+        self.tokens = tokens;
         self.refilled_at += Duration::from_nanos(u64::try_from(paid).unwrap_or(u64::MAX));
     }
 }
@@ -247,7 +250,10 @@ mod tests {
         let mut bucket = drained(start);
 
         assert_eq!(bucket.tokens(start), 0);
-        assert_eq!(bucket.tokens(start + Duration::from_secs(2)), 2 * RATE);
+        assert_eq!(
+            bucket.tokens(start + Duration::from_secs(2)),
+            i128::from(2 * RATE)
+        );
         assert!(!bucket.try_take(2 * RATE + 1, start + Duration::from_secs(2)));
         assert!(bucket.try_take(2 * RATE, start + Duration::from_secs(2)));
         assert_eq!(bucket.tokens(start + Duration::from_secs(2)), 0);
@@ -271,7 +277,10 @@ mod tests {
         let start = Instant::now();
         let mut bucket = drained(start);
 
-        assert_eq!(bucket.tokens(start + Duration::from_secs(3_600)), CAPACITY);
+        assert_eq!(
+            bucket.tokens(start + Duration::from_secs(3_600)),
+            i128::from(CAPACITY)
+        );
     }
 
     #[test]
@@ -284,7 +293,42 @@ mod tests {
 
         assert!(!bucket.try_take(10 * CAPACITY, nearly_full));
         assert!(bucket.try_take(10 * CAPACITY, full));
-        assert_eq!(bucket.tokens(full), 0, "it costs the whole bucket");
+    }
+
+    #[test]
+    fn given_an_upload_larger_than_the_bucket_when_admitted_should_hold_the_next_until_its_bytes_are_paid()
+     {
+        let start = Instant::now();
+        let mut bucket = TokenBucket::full(RATE, CAPACITY, start);
+        let nearly_paid = start + Duration::from_millis(89_999);
+        let paid = start + Duration::from_secs(90);
+
+        assert!(bucket.try_take(10 * CAPACITY, start));
+
+        assert_eq!(bucket.tokens(start), -i128::from(9 * CAPACITY));
+        assert!(!bucket.try_take(1, nearly_paid));
+        assert_eq!(bucket.tokens(paid), 0);
+        assert!(!bucket.try_take(1, paid));
+        assert!(bucket.try_take(1, paid + Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn given_uploads_larger_than_the_bucket_when_they_follow_each_other_should_average_the_rate() {
+        let start = Instant::now();
+        let mut bucket = TokenBucket::full(RATE, CAPACITY, start);
+        let mut sent = 0;
+
+        for second in 0..=1_000 {
+            if bucket.try_take(10 * CAPACITY, start + Duration::from_secs(second)) {
+                sent += 10 * CAPACITY;
+            }
+        }
+
+        assert_eq!(
+            sent,
+            11 * 10 * CAPACITY,
+            "one upload every 100 s, the time its bytes take at the rate"
+        );
     }
 
     #[test]
@@ -390,7 +434,7 @@ mod tests {
 
         assert!(!pacing.admit(namespace(), 7, UPLOAD_BURST_BYTES, start));
 
-        assert_eq!(pacing.bucket.tokens(start), UPLOAD_BURST_BYTES);
+        assert_eq!(pacing.bucket.tokens(start), i128::from(UPLOAD_BURST_BYTES));
     }
 
     #[test]
