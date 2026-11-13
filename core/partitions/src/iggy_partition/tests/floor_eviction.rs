@@ -19,7 +19,7 @@ use super::eviction::{KEEP_NOTHING, chain_records, evict, reboot, tiered_partiti
 use super::segment_chain::{PREFIX, tiered_partition};
 use super::*;
 use crate::SegmentLocation;
-use crate::segment_chain::{ChainRecord, hash_segment_file};
+use crate::segment_chain::{ChainRecord, chain_path, hash_segment_file};
 use crate::state_machine::MachineCommand;
 use crate::tiered_floor::{ADVANCE_TIERED_FLOOR, AdvanceTieredFloor};
 
@@ -29,7 +29,10 @@ const SEALED: [(u64, u64); 2] = [(0, 1), (2, 3)];
 
 /// The advance the primary commits once the store holds the segment from
 /// `start` to `up_to`, with the hash of the bytes this replica holds.
-async fn advance_over(directory: &Path, (start, up_to): (u64, u64)) -> AdvanceTieredFloor {
+pub(super) async fn advance_over(
+    directory: &Path,
+    (start, up_to): (u64, u64),
+) -> AdvanceTieredFloor {
     let log = directory.join(format!("{start:020}.log"));
     let size = std::fs::metadata(&log).unwrap().len();
     let hashes = hash_segment_file(&log.to_string_lossy(), size)
@@ -233,4 +236,156 @@ async fn given_a_committed_advance_when_it_applies_should_reach_the_partition_on
 
     assert_eq!(partition.tiered_floor(), Some(9));
     assert_eq!(partition.pending_advances, [advance]);
+}
+
+/// A partition with an open chain and a WAL that a checkpoint is due on, and
+/// its directory.
+async fn partition_due_a_checkpoint() -> (
+    tempfile::TempDir,
+    PartitionsConfig,
+    PathBuf,
+    IggyPartition<RecordingBus>,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = repair_config();
+    config.path_layout.streams_root = root.path().to_string_lossy().into_owned();
+    let directory = PathBuf::from(config.get_partition_path(1, 1, 0));
+    std::fs::create_dir_all(&directory).unwrap();
+    let (mut partition, _) = recording_partition_at(1, 3);
+    partition.set_partition_dir(directory.to_string_lossy().into_owned());
+    partition.runtime_options.durability = iggy_common::Durability::Replicated;
+    partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Replicated;
+    partition.open_persistence().await.unwrap();
+    partition.log.retire_front().unwrap();
+    partition.install_empty_segment(&config, 0).await.unwrap();
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+    Box::pin(partition.open_segment_chain(PREFIX))
+        .await
+        .unwrap();
+    let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+    let prepare = checksummed_segment_prepare(1, 0, 0, b"payload");
+    let writer = hold_wal_writer(&persistence);
+    Box::pin(partition.on_replicate(prepare)).await;
+    writer.await;
+    Box::pin(commit_on_heartbeat(&mut partition, &config, 1)).await;
+    Box::pin(settle_partition_io(&mut partition, &config)).await;
+    persistence.request_checkpoint();
+    assert!(partition.needs_persistence_checkpoint());
+    (root, config, directory, partition)
+}
+
+const UNSEALED_ADVANCE: AdvanceTieredFloor = AdvanceTieredFloor {
+    start: 0,
+    up_to: 0,
+    hash: [7; 32],
+};
+
+/// The checkpoint keeps the floor and lets the WAL drop the advance, so a
+/// checkpoint taken before the chain holds the advance would leave a restarted
+/// replica with a floor it can never match against its segments.
+#[compio::test]
+async fn given_an_advance_not_yet_in_the_chain_when_a_checkpoint_is_due_should_wait_for_its_record()
+{
+    let (_root, config, directory, mut partition) = Box::pin(partition_due_a_checkpoint()).await;
+    let advance = UNSEALED_ADVANCE;
+
+    partition.note_tiered_advance(advance);
+
+    assert!(!partition.needs_persistence_checkpoint());
+    Box::pin(settle_partition_io(&mut partition, &config)).await;
+    assert_eq!(
+        chain_records(&directory).await,
+        [ChainRecord::Advanced(advance)]
+    );
+    assert!(partition.needs_persistence_checkpoint());
+}
+
+/// A checkpoint can still run while the partition shuts down, so the advances
+/// it would outrun are recorded first. The rest of the chain's work is left
+/// for the next start.
+#[compio::test]
+async fn given_an_advance_not_yet_in_the_chain_when_shutting_down_should_still_record_it() {
+    let (_root, config, directory, mut partition) = Box::pin(partition_due_a_checkpoint()).await;
+    partition.note_tiered_advance(UNSEALED_ADVANCE);
+
+    partition.begin_shutdown_io();
+
+    assert!(partition.checkpoint_waits_for_advances());
+    Box::pin(settle_partition_io(&mut partition, &config)).await;
+    assert_eq!(
+        chain_records(&directory).await,
+        [ChainRecord::Advanced(UNSEALED_ADVANCE)]
+    );
+    assert!(!partition.checkpoint_waits_for_advances());
+    assert_eq!(partition.pending_tiering(), None);
+}
+
+/// Put a directory where the chain file is, so every append to it fails.
+fn break_chain_file(directory: &Path) -> PathBuf {
+    let chain = PathBuf::from(chain_path(&directory.to_string_lossy()));
+    let kept = chain.with_extension("kept");
+    std::fs::rename(&chain, &kept).unwrap();
+    std::fs::create_dir(&chain).unwrap();
+    kept
+}
+
+/// A failed append is retried after a delay that grows to a minute, and the
+/// WAL must not grow for as long as the chain file stays unwritable.
+#[compio::test]
+async fn given_an_advance_whose_record_fails_when_a_checkpoint_is_due_should_not_wait_for_the_retry()
+ {
+    let (_root, config, directory, mut partition) = Box::pin(partition_due_a_checkpoint()).await;
+    let kept = break_chain_file(&directory);
+    partition.note_tiered_advance(UNSEALED_ADVANCE);
+    assert!(!partition.needs_persistence_checkpoint());
+
+    Box::pin(settle_partition_io(&mut partition, &config)).await;
+
+    assert_eq!(partition.pending_advances, [UNSEALED_ADVANCE]);
+    assert_eq!(
+        partition.pending_tiering(),
+        Some(PREFIX),
+        "the retry is armed"
+    );
+    assert!(partition.needs_persistence_checkpoint());
+
+    // The shutdown does not wait for the retry either.
+    partition.begin_shutdown_io();
+    Box::pin(settle_partition_io(&mut partition, &config)).await;
+    assert_eq!(partition.pending_tiering(), None);
+    assert!(!partition.checkpoint_waits_for_advances());
+    std::fs::remove_dir(chain_path(&directory.to_string_lossy())).unwrap();
+    std::fs::rename(kept, chain_path(&directory.to_string_lossy())).unwrap();
+    assert_eq!(chain_records(&directory).await, []);
+}
+
+/// While segments wait to be hashed the lane always has a next job, so the
+/// queue is never found idle and emptied as a whole.
+#[compio::test]
+async fn given_a_recorded_advance_when_the_next_job_is_chosen_should_leave_the_queue() {
+    let config = repair_config();
+    let records = segment_records(RECEIVER_OPS);
+    let (directory, mut partition) = Box::pin(tiered_partition(&records, records.len())).await;
+    let first = Box::pin(advance_over(directory.path(), SEALED[0])).await;
+    let second = Box::pin(advance_over(directory.path(), SEALED[1])).await;
+    partition.note_tiered_advance(first);
+    partition.note_tiered_advance(second);
+
+    let crate::PartitionIoStep::Ready(plan) = partition.resume_io(&config).await else {
+        panic!("the first advance is ready to record");
+    };
+    Box::pin(execute_partition_io_plan(&mut partition, &config, plan)).await;
+    assert_eq!(
+        chain_records(directory.path()).await,
+        [ChainRecord::Advanced(first)]
+    );
+    assert!(matches!(
+        partition.resume_io(&config).await,
+        crate::PartitionIoStep::Ready(_)
+    ));
+
+    assert_eq!(partition.pending_advances, [second]);
 }

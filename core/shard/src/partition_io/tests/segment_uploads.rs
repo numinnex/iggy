@@ -378,6 +378,7 @@ async fn given_a_cancelled_upload_when_the_next_pass_runs_should_not_make_it_wai
             FinishedSegmentUpload {
                 namespace: namespace(),
                 created_revision: partition.created_revision(),
+                attempt: partition.segment_upload_attempt().unwrap(),
                 record: partition.sealed_segment_record(0).unwrap(),
                 outcome: Err(TierJobCancelled),
             },
@@ -389,6 +390,54 @@ async fn given_a_cancelled_upload_when_the_next_pass_runs_should_not_make_it_wai
         .upload_segments_at(namespace(), true, cancelled_at)
         .await;
     until(&owner, |_| uploader.started() == [0, 0]).await;
+}
+
+/// The segment of an upload the partition gave up is started again, and the
+/// first upload's result can arrive while the second one runs.
+#[compio::test]
+async fn given_a_replaced_upload_when_the_first_one_fails_late_should_not_touch_the_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(sealed_owner(directory.path())).await;
+    let uploader = RecordingUploader::new(Store::Hangs);
+    owner.set_segment_uploader(Some(uploader.clone()));
+    let now = Instant::now();
+    owner.upload_segments_at(namespace(), true, now).await;
+    until(&owner, |_| uploader.started() == [0]).await;
+    let partition = owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap();
+    let created_revision = partition.created_revision();
+    let given_up = partition.segment_upload_attempt().unwrap();
+    let record = partition.sealed_segment_record(0).unwrap();
+    partition.cancel_segment_upload();
+    owner.upload_segments_at(namespace(), true, now).await;
+    until(&owner, |_| uploader.started() == [0, 0]).await;
+    let replacement = partition.segment_upload_attempt().unwrap();
+    assert_ne!(replacement, given_up);
+
+    owner
+        .segment_upload_finished_at(
+            FinishedSegmentUpload {
+                namespace: namespace(),
+                created_revision,
+                attempt: given_up,
+                record,
+                outcome: Ok(Err(UploadError::Io(std::io::Error::other("late")))),
+            },
+            now,
+        )
+        .await;
+
+    assert_eq!(partition.segment_upload_attempt(), Some(replacement));
+    assert!(
+        owner
+            .upload_pacing
+            .borrow_mut()
+            .admit(namespace(), created_revision, 1, now),
+        "a result nobody waits for makes no partition wait"
+    );
 }
 
 /// The wait is kept on the shard, so it has to go when the partition does.
@@ -659,12 +708,14 @@ async fn given_a_result_of_another_incarnation_when_it_arrives_should_not_settle
     owner.on_upload_segments(namespace(), true, None).await;
     let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
     let created_revision = partition.created_revision();
+    let attempt = partition.segment_upload_attempt().unwrap();
     let record = partition.sealed_segment_record(0).unwrap();
 
     owner
         .on_segment_upload_finished(FinishedSegmentUpload {
             namespace: namespace(),
             created_revision: created_revision + 1,
+            attempt,
             record,
             outcome: Ok(Ok(())),
         })
@@ -676,6 +727,7 @@ async fn given_a_result_of_another_incarnation_when_it_arrives_should_not_settle
         .on_segment_upload_finished(FinishedSegmentUpload {
             namespace: namespace(),
             created_revision,
+            attempt,
             record,
             outcome: Ok(Ok(())),
         })
@@ -731,6 +783,7 @@ async fn given_an_undelivered_result_when_a_timed_pass_settles_it_should_send_it
             .push(FinishedSegmentUpload {
                 namespace: namespace(),
                 created_revision: partition.created_revision(),
+                attempt: partition.segment_upload_attempt().unwrap(),
                 record: partition.sealed_segment_record(0).unwrap(),
                 outcome: Ok(Ok(())),
             });

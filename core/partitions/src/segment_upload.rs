@@ -43,6 +43,7 @@ use server_common::send_messages::decode_batch_slice;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::remote_segments::IndexCheck;
 use crate::segment_chain::{SegmentHasher, SegmentRecord};
+use crate::segment_recovery::MAX_RECOVERABLE_BATCH_BYTES;
 use crate::state_transfer::{ChunkHasher, hash_segment_range};
 
 /// Bytes of a file that one piece of a put body holds.
@@ -58,6 +59,16 @@ pub struct SegmentUpload {
     pub log_path: String,
     pub index_path: String,
 }
+
+/// One start of an upload by a partition. A segment whose upload was
+/// cancelled is started again under another attempt, so the attempt, and not
+/// the segment, says which upload a result belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentUploadAttempt(pub(crate) u64);
+
+/// An upload a partition started: what to upload, the scope to run it under,
+/// and the attempt its result is handed back with.
+pub type StartedSegmentUpload = (SegmentUpload, TierScopeToken, SegmentUploadAttempt);
 
 #[derive(Debug, thiserror::Error)]
 pub enum UploadError {
@@ -162,7 +173,7 @@ pub async fn upload_segment<S: ObjectStore>(
         start_offset: record.start_offset,
         reason,
     };
-    let mut check = LogCheck::default();
+    let mut check = LogCheck::new(record.size);
     hash_segment_range(&upload.log_path, 0, record.size, &mut check, None).await?;
     check.finish().map_err(fault)?;
     let hashes = check.hasher.finalize();
@@ -289,49 +300,67 @@ fn pieces(file: compio::fs::File, len: u64) -> impl Stream<Item = io::Result<Byt
 
 /// Takes a `.log` in order: its hashes, and every batch against its own
 /// checksum.
-#[derive(Default)]
 struct LogCheck {
     hasher: SegmentHasher,
     /// The bytes of the batch that the chunks so far have not completed.
     partial: Vec<u8>,
-    corrupt: bool,
+    /// The bytes of the segment after the batches checked so far.
+    unchecked: u64,
+    fault: Option<&'static str>,
 }
 
 impl LogCheck {
-    /// Fails when a batch did not match its checksum, or the file ends inside
-    /// one.
-    const fn finish(&self) -> Result<(), &'static str> {
-        if self.corrupt {
-            Err("a batch does not match its checksum")
-        } else if self.partial.is_empty() {
-            Ok(())
-        } else {
-            Err("it ends inside a batch")
+    /// A check of a segment of `size` bytes.
+    fn new(size: u64) -> Self {
+        Self {
+            hasher: SegmentHasher::default(),
+            partial: Vec::new(),
+            unchecked: size,
+            fault: None,
         }
+    }
+
+    /// Fails when a batch is not a whole, checksummed batch of the segment,
+    /// or the file ends inside one.
+    const fn finish(&self) -> Result<(), &'static str> {
+        match self.fault {
+            Some(fault) => Err(fault),
+            None if self.partial.is_empty() => Ok(()),
+            None => Err("it ends inside a batch"),
+        }
+    }
+
+    fn fail(&mut self, fault: &'static str) {
+        self.fault = Some(fault);
+        self.partial = Vec::new();
     }
 }
 
 impl ChunkHasher for LogCheck {
     fn update(&mut self, bytes: &[u8]) {
         self.hasher.update(bytes);
-        if self.corrupt {
+        if self.fault.is_some() {
             return;
         }
         self.partial.extend_from_slice(bytes);
         let mut at = 0;
         while let Some(header) = self.partial.get(at..at + BATCH_HEADER_SIZE) {
             let Ok(header) = BatchHeader::decode(header) else {
-                self.corrupt = true;
-                return;
+                return self.fail("a batch does not match its checksum");
             };
+            // Checked before the batch is waited for: a length that no batch
+            // has would otherwise keep every byte up to it in memory.
+            if header.batch_length > self.unchecked.min(MAX_RECOVERABLE_BATCH_BYTES) {
+                return self.fail("a batch is longer than a batch can be");
+            }
             let Some(batch) = self.partial.get(at..at + header.total_size()) else {
                 break;
             };
             if decode_batch_slice(batch).is_err() {
-                self.corrupt = true;
-                return;
+                return self.fail("a batch does not match its checksum");
             }
             at += header.total_size();
+            self.unchecked -= header.batch_length;
         }
         self.partial.drain(..at);
     }

@@ -16,9 +16,10 @@
 // under the License.
 
 use super::{
-    Chain, ChainError, ChainRecord, HEADER_SIZE, HashSource, ObjectPrefix, RECORD_SIZE,
-    SegmentDigest, SegmentHashes, SegmentRecord, append_record, chain_path, create_chain,
-    decode_chain, encode_header, hash_segment_file, read_chain,
+    Chain, ChainError, ChainRecord, EvictionFailure, EvictionJob, HEADER_SIZE, HashSource,
+    LiveChain, ObjectPrefix, RECORD_SIZE, SegmentChain, SegmentDigest, SegmentHashes,
+    SegmentRecord, append_record, chain_path, create_chain, decode_chain, encode_header,
+    hash_segment_file, read_chain,
 };
 use crate::state_transfer::ChunkHasher;
 
@@ -174,6 +175,31 @@ async fn given_a_torn_tail_when_appending_at_the_valid_length_should_overwrite_i
 
 /// A file spanning more than one read chunk hashes as the whole bytes do, and
 /// a shorter size hashes only its prefix.
+/// The next eviction starts only after a directory sync made this unlink
+/// durable, so a sync that fails must fail the eviction, even on the retry
+/// that finds the `.log` already gone.
+#[compio::test]
+async fn given_a_log_already_unlinked_when_the_directory_cannot_be_synced_should_fail_the_eviction()
+{
+    let directory = tempfile::tempdir().unwrap();
+    let evict = |messages_path: std::path::PathBuf| EvictionJob {
+        start_offset: 0,
+        append: None,
+        messages_path: Some(messages_path.to_string_lossy().into_owned()),
+    };
+
+    let unsynced = evict(directory.path().join("missing").join("0.log"))
+        .execute()
+        .await;
+    assert_eq!(unsynced.outcome, Err(EvictionFailure::Sync));
+
+    let log = directory.path().join("0.log");
+    std::fs::write(&log, b"log").unwrap();
+    assert_eq!(evict(log.clone()).execute().await.outcome, Ok(()));
+    assert!(!log.exists());
+    assert_eq!(evict(log).execute().await.outcome, Ok(()));
+}
+
 #[compio::test]
 async fn given_a_segment_file_when_hashed_from_disk_should_match_its_bytes() {
     let directory = tempfile::tempdir().unwrap();
@@ -210,6 +236,47 @@ fn given_a_floor_advance_when_encoded_should_decode_to_the_same_record() {
     let stray = HEADER_SIZE + 40;
     bytes[stray] = 1;
     assert_eq!(decode_chain(&bytes).unwrap().records, Vec::new());
+}
+
+#[test]
+fn given_advances_waiting_for_segments_when_one_seals_should_settle_only_those_it_holds() {
+    let advanced = |up_to| {
+        ChainRecord::Advanced(crate::tiered_floor::AdvanceTieredFloor {
+            start: up_to,
+            up_to,
+            hash: [7; 32],
+        })
+    };
+    let waiting = |chain: &SegmentChain| chain.advances.keys().copied().collect::<Vec<_>>();
+    let empty = Chain {
+        prefix: PREFIX,
+        records: Vec::new(),
+        valid_len: HEADER_SIZE as u64,
+        torn_tail: false,
+    };
+    let mut chain = SegmentChain::load(String::new(), LiveChain::new(&empty), None);
+    // The first ends its segment, the second ends inside the next one, and
+    // the third is two segments ahead.
+    for up_to in [9, 14, 29] {
+        assert_eq!(chain.note_appended(&advanced(up_to)), Vec::<u64>::new());
+    }
+
+    let first = ChainRecord::Sealed(segment(0, HashSource::CommitPath));
+    assert_eq!(chain.note_appended(&first), Vec::<u64>::new());
+    assert!(chain.evictable(0, 9));
+    assert_eq!(waiting(&chain), [14, 29]);
+
+    let second = ChainRecord::Sealed(segment(10, HashSource::CommitPath));
+    assert_eq!(chain.note_appended(&second), [14]);
+    assert!(!chain.evictable(10, 19));
+    assert_eq!(waiting(&chain), [29]);
+
+    assert_eq!(
+        chain.note_appended(&ChainRecord::TrimPoint(29)),
+        Vec::<u64>::new()
+    );
+    assert_eq!(waiting(&chain), Vec::<u64>::new());
+    assert_eq!(chain.diverged().iter().copied().collect::<Vec<_>>(), [14]);
 }
 
 #[test]

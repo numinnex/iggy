@@ -1215,6 +1215,9 @@ pub struct FinishedSegmentUpload {
     /// The incarnation that started the upload. Slab ids are reused after a
     /// delete, so the namespace alone can name a later partition.
     pub created_revision: u64,
+    /// The attempt the partition started. A segment is started again after a
+    /// cancelled upload, so the record alone can name a later attempt.
+    pub attempt: partitions::SegmentUploadAttempt,
     pub record: partitions::segment_chain::SegmentRecord,
     pub outcome: partitions::UploadOutcome,
 }
