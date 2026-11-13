@@ -707,13 +707,16 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         // and the next batch rolls there again, replacing the name. A name above
         // it holds only the dropped suffix. Left in place, a replacement that
         // rolls elsewhere would cover it, and recovery refuses that overlap.
-        // Recovery also unlinks every name above the tail, so a crash that loses
-        // these unlinks needs no directory barrier.
+        // Recovery unlinks every name above the tail, so a crash that loses
+        // these unlinks is harmless only until a replacement moves the tail
+        // past them. The frontier publishing that replacement must sync the
+        // directory first.
         let parent = self.segment_directory()?.to_path_buf();
         for start_offset in dropped_segments.range((
             Bound::Excluded(cursor.position.next_offset),
             Bound::Unbounded,
         )) {
+            self.segment_links_dirty = true;
             self.remove_segment_name(&parent.join(format!("{start_offset:020}.log")))
                 .await?;
         }
