@@ -120,9 +120,10 @@ pub struct SealedSegmentReadState {
     /// others.
     /// Timestamp polls bypass it.
     pub(crate) offset_cursor: Cell<Option<SealedOffsetCursor>>,
-    /// Set while a poll fetches the `.index` object of a remote segment, so a
-    /// second poll does not write the same file under it.
-    pub(crate) index_fetching: Cell<bool>,
+    /// The fetch of a remote segment's `.index` object while one runs, which
+    /// every poll that needs the index joins. Ends with this state: a wipe or
+    /// the last handle going away cancels it.
+    pub(crate) index_fetch: RefCell<Option<IndexFetch>>,
     /// The last failed read of the segment's objects, kept until its backoff
     /// runs out. A client that retries meanwhile gets the same answer at once,
     /// and the store gets no request.
@@ -235,6 +236,31 @@ enum SegmentBytes<'a> {
         /// walk opened it.
         replanned: bool,
     },
+}
+
+impl SealedSegmentReadState {
+    /// The failure remembered before a wait on the store that starts at
+    /// `now`, or its fault as `Err` while the backoff still runs.
+    fn remembered_failure(&self, now: Instant) -> Result<Option<RemoteFailure>, DiskFault> {
+        let remembered = self.remote_failure.get();
+        match remembered {
+            Some(failure) if now < failure.until => Err(failure.fault),
+            _ => Ok(remembered),
+        }
+    }
+
+    /// Remember how a wait on the store ended: a fault for longer than the
+    /// `previous` one in a row, and an answer clears it.
+    fn remember_outcome(&self, previous: Option<RemoteFailure>, fault: Option<DiskFault>) {
+        self.remote_failure.set(fault.map(|fault| {
+            let failures = previous.map_or(1, |failure| failure.failures.saturating_add(1));
+            RemoteFailure {
+                fault,
+                failures,
+                until: Instant::now() + remote_failure_backoff(failures),
+            }
+        }));
+    }
 }
 
 impl SegmentBytes<'_> {
@@ -458,7 +484,8 @@ impl PollReadResult {
     ///
     /// A poll without a status on its reply shows a failed read as an empty
     /// one, which a consumer waits out. This one never reads again, so the
-    /// owner refuses the poll with it instead.
+    /// owner refuses the poll with it instead, once the read's history and
+    /// owner prove to be the ones it still serves.
     #[must_use]
     pub fn tiered_read_failure(&self) -> Option<IggyError> {
         self.read_error
@@ -530,8 +557,7 @@ impl PollPlan {
     /// can wait on the store.
     #[must_use]
     pub fn reads_remote(&self) -> bool {
-        matches!(&self.tier, PollTier::Disk { disk, .. }
-            if disk.segments.iter().any(|segment| segment.source != SegmentSource::Local))
+        matches!(&self.tier, PollTier::Disk { disk, .. } if disk.reads_remote())
     }
 
     /// Stop waiting for the object store at `deadline`. The read then returns
@@ -1202,7 +1228,8 @@ impl DiskReadPlan {
     ///
     /// A sealed segment planned as local can lose its `.log` to an eviction
     /// before the walk reaches it. Its bytes are then in the store under the
-    /// partition's prefix, so the walk reads them there instead of failing.
+    /// partition's prefix, so a walk that may wait on the store reads them
+    /// there instead of failing (see [`Self::evicted_source`]).
     async fn open_segment<'a>(
         &'a self,
         segment: &'a DiskSegment,
@@ -1235,9 +1262,21 @@ impl DiskReadPlan {
         }
     }
 
+    /// Whether the plan named a segment in the object store when it was built.
+    fn reads_remote(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|segment| segment.source != SegmentSource::Local)
+    }
+
     /// The object a sealed segment's bytes are in once its `.log` is gone.
+    ///
+    /// `None` for a plan that named no remote segment. Its owner admitted it
+    /// as a poll of local data, outside the cap on the polls that may wait on
+    /// the store, so it asks for a retry instead. The retry's plan names the
+    /// segment as remote and is admitted under the cap.
     fn evicted_source(&self, segment: &DiskSegment) -> Option<(&RemoteSegments, RemoteRange)> {
-        let remote = self.remote.as_deref()?;
+        let remote = self.remote.as_deref().filter(|_| self.reads_remote())?;
         let prefix = self.object_prefix.filter(|_| segment.sealed)?;
         Some((
             remote,
@@ -1308,12 +1347,7 @@ impl DiskReadPlan {
         wait: impl Future<Output = Result<T, DiskFault>>,
     ) -> Result<T, DiskFault> {
         let now = Instant::now();
-        let remembered = state.remote_failure.get();
-        if let Some(failure) = remembered
-            && now < failure.until
-        {
-            return Err(failure.fault);
-        }
+        let remembered = state.remembered_failure(now)?;
         let result = match self.deadline {
             None => wait.await,
             Some(deadline) if deadline <= now => return Err(DiskFault::Retryable),
@@ -1321,14 +1355,57 @@ impl DiskReadPlan {
                 .await
                 .unwrap_or(Err(DiskFault::Retryable)),
         };
-        state.remote_failure.set(result.as_ref().err().map(|fault| {
-            let failures = remembered.map_or(1, |failure| failure.failures.saturating_add(1));
-            RemoteFailure {
-                fault: *fault,
-                failures,
-                until: Instant::now() + remote_failure_backoff(failures),
-            }
-        }));
+        state.remember_outcome(remembered, result.as_ref().err().copied());
+        result
+    }
+
+    /// Wait for the segment's `.index` object to be at `path`, starting its
+    /// fetch unless one runs.
+    ///
+    /// The fetch is not this poll's: a deadline that ends the wait leaves it
+    /// running for the next poll of the segment to join, and is no failure of
+    /// the store. A fault the fetch ends with is one, remembered like that of
+    /// any other wait (see [`Self::wait_for_store`]).
+    async fn wait_for_index(
+        &self,
+        segment: &DiskSegment,
+        log: &RemoteRange,
+        partition_dir: &str,
+        path: &str,
+    ) -> Result<(), DiskFault> {
+        let remote = self.remote.as_ref().ok_or(DiskFault::Retryable)?;
+        let state = &segment.read_state;
+        let now = Instant::now();
+        let remembered = state.remembered_failure(now)?;
+        if self.deadline.is_some_and(|deadline| deadline <= now) {
+            return Err(DiskFault::Retryable);
+        }
+        let fetched = state
+            .index_fetch
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                IndexFetch::start(
+                    Rc::clone(remote),
+                    log.clone(),
+                    segment.start_offset,
+                    partition_dir.to_owned(),
+                    path.to_owned(),
+                )
+            })
+            .wait();
+        let ended = match self.deadline {
+            None => fetched.await,
+            Some(deadline) => compio::time::timeout(deadline - now, fetched)
+                .await
+                .map_err(|_| DiskFault::Retryable)?,
+        };
+        state
+            .index_fetch
+            .borrow_mut()
+            .take_if(|fetch| fetch.is_over());
+        // A cancelled fetch belonged to files that were replaced under it.
+        let result = ended.ok_or(DiskFault::Retryable)?;
+        state.remember_outcome(remembered, result.err());
         result
     }
 
@@ -1479,17 +1556,8 @@ impl DiskReadPlan {
         {
             return Ok(Some((reader, entry_count)));
         }
-        let remote = self.remote.as_deref().ok_or(DiskFault::Retryable)?;
-        let fetch = async {
-            // A second poll of the segment waits for the first one's fetch
-            // through its client's retry.
-            let _fetch = IndexFetch::begin(&segment.read_state.index_fetching)
-                .ok_or(DiskFault::Retryable)?;
-            remote
-                .fetch_index(log, segment.start_offset, partition_dir, path)
-                .await
-        };
-        self.wait_for_store(&segment.read_state, fetch).await?;
+        self.wait_for_index(segment, log, partition_dir, path)
+            .await?;
         self.open_local_index(path)
             .await
             .map(Some)

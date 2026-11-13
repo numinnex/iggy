@@ -611,10 +611,6 @@ where
                 return;
             }
         }
-        if let Some(error) = result.tiered_read_failure() {
-            let _ = reply.try_send(PartitionReadReply::Rejected(error));
-            return;
-        }
         self.accept_poll_result(namespace, result, reply, None)
             .await;
     }

@@ -20,17 +20,21 @@
 //! A poll plan names a remote segment by an object and a byte range in it,
 //! and the walk reads that range with ranged GETs straight from the store.
 //! The segment's sparse index is the local `.index` while one is usable, and
-//! otherwise the `.index` object, fetched once and kept on disk.
+//! otherwise the `.index` object, fetched once and kept on disk. The fetch
+//! runs in a task of its own (see [`IndexFetch`]), apart from the polls that
+//! wait for it.
 //!
 //! No partition is handed a store yet, so nothing in production reads one.
 
-use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::Duration;
 
 use compio::io::AsyncWriteAtExt;
+use compio::runtime::JoinHandle;
 use futures::FutureExt;
-use futures::future::LocalBoxFuture;
+use futures::channel::oneshot;
+use futures::future::{LocalBoxFuture, Shared};
 use iggy_object_store::{
     ErrorClass, KeyLayout, ObjectRange, ObjectStore, ObjectStoreError, SegmentKey, SegmentObject,
 };
@@ -45,6 +49,13 @@ use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
 /// Bytes of an index object that one GET asks for: a whole number of entries,
 /// so every response can be checked on its own.
 const INDEX_FETCH_CHUNK: u64 = (IGGY_INDEX_SIZE as u64) * 32 * 1024;
+
+/// How long the store may take to answer one GET of an index object.
+///
+/// No poll's deadline ends an index fetch, so without a limit of its own a
+/// store that stopped answering would hold the fetch, and every poll that
+/// joins it, for good.
+const INDEX_GET_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The ranged read of an [`ObjectStore`], behind a pointer, so a partition
 /// does not carry the provider's type.
@@ -95,12 +106,18 @@ impl RemoteRange {
 pub struct RemoteSegments {
     objects: Rc<dyn RemoteObjects>,
     layout: KeyLayout,
+    /// See [`INDEX_GET_TIMEOUT`].
+    pub(crate) index_get_timeout: Duration,
 }
 
 impl RemoteSegments {
     #[must_use]
     pub fn new(objects: Rc<dyn RemoteObjects>, layout: KeyLayout) -> Self {
-        Self { objects, layout }
+        Self {
+            objects,
+            layout,
+            index_get_timeout: INDEX_GET_TIMEOUT,
+        }
     }
 
     /// Exactly `len` bytes of the segment in `source`, from byte `position`
@@ -199,10 +216,19 @@ impl RemoteSegments {
         let mut at = 0;
         let mut whole: Option<(String, u64)> = None;
         loop {
-            let object = self
-                .objects
-                .get_range(key, at..at + INDEX_FETCH_CHUNK)
+            let get = self.objects.get_range(key, at..at + INDEX_FETCH_CHUNK);
+            let object = compio::time::timeout(self.index_get_timeout, get)
                 .await
+                .map_err(|_| {
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        key,
+                        at,
+                        "remote poll: the store did not answer a read of an index in time"
+                    );
+                    DiskFault::Retryable
+                })?
                 .map_err(|error| fault(key, &error))?;
             let (etag, size) = whole.get_or_insert_with(|| (object.etag.clone(), object.size));
             if *etag != object.etag || *size != object.size {
@@ -305,20 +331,51 @@ fn local_fault(path: &str, error: &std::io::Error) -> DiskFault {
     DiskFault::Retryable
 }
 
-/// Marks a segment's index as being fetched, so a second poll of the segment
-/// does not fetch and write the same file under the first.
-pub struct IndexFetch<'a>(&'a Cell<bool>);
-
-impl<'a> IndexFetch<'a> {
-    /// `None` while another poll holds the fetch.
-    pub(crate) fn begin(flag: &'a Cell<bool>) -> Option<Self> {
-        (!flag.replace(true)).then(|| Self(flag))
-    }
+/// A segment's `.index` object on its way to the disk, in a task of its own.
+///
+/// The polls that need the index wait for the task, each up to its own
+/// deadline, and the task goes on without them. So an index that takes longer
+/// to fetch than one poll may wait still arrives, and a later poll finds it on
+/// disk. The segment's read state owns the fetch: dropping it cancels the
+/// task, and the polls still waiting learn that at once.
+#[derive(Debug)]
+pub struct IndexFetch {
+    fetched: Shared<oneshot::Receiver<Result<(), DiskFault>>>,
+    /// Dropping the handle cancels the task.
+    _task: JoinHandle<()>,
 }
 
-impl Drop for IndexFetch<'_> {
-    fn drop(&mut self) {
-        self.0.set(false);
+impl IndexFetch {
+    /// Start [`RemoteSegments::fetch_index`] with the same arguments.
+    pub(crate) fn start(
+        remote: Rc<RemoteSegments>,
+        log: RemoteRange,
+        start_offset: u64,
+        partition_dir: String,
+        index_path: String,
+    ) -> Self {
+        let (done, fetched) = oneshot::channel();
+        let task = compio::runtime::spawn(async move {
+            let result = remote
+                .fetch_index(&log, start_offset, &partition_dir, &index_path)
+                .await;
+            // Every poll that waited may have reached its deadline.
+            let _ = done.send(result);
+        });
+        Self {
+            fetched: fetched.shared(),
+            _task: task,
+        }
+    }
+
+    /// How the fetch ended, or `None` when it was cancelled.
+    pub(crate) fn wait(&self) -> impl Future<Output = Option<Result<(), DiskFault>>> + 'static {
+        self.fetched.clone().map(Result::ok)
+    }
+
+    /// Whether a poll has seen the fetch end.
+    pub(crate) fn is_over(&self) -> bool {
+        self.fetched.peek().is_some()
     }
 }
 
@@ -450,13 +507,84 @@ mod tests {
         assert!(!check.accept(&entries(&[[103, 8, 20]])));
     }
 
-    #[test]
-    fn given_a_fetch_in_flight_when_a_second_begins_should_wait_until_the_first_ends() {
-        let flag = Cell::new(false);
-        let first = IndexFetch::begin(&flag).unwrap();
-        assert!(IndexFetch::begin(&flag).is_none());
-        assert!(IndexFetch::begin(&flag).is_none());
-        drop(first);
-        assert!(IndexFetch::begin(&flag).is_some());
+    /// A store that never answers.
+    struct Silent;
+
+    impl RemoteObjects for Silent {
+        fn get_range<'a>(
+            &'a self,
+            _key: &'a str,
+            _range: Range<u64>,
+        ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+            futures::future::pending().boxed_local()
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_store_that_never_answers_when_fetching_should_give_up_and_write_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let partition_dir = directory.path().to_string_lossy().into_owned();
+        let index_path = format!("{partition_dir}/{START_OFFSET:020}.index");
+        let mut remote = RemoteSegments::new(Rc::new(Silent), KeyLayout::new("iggy").unwrap());
+        remote.index_get_timeout = Duration::from_millis(20);
+
+        let fetched = remote
+            .fetch_index(&log(), START_OFFSET, &partition_dir, &index_path)
+            .await;
+
+        assert_eq!(fetched, Err(DiskFault::Retryable));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    /// A fetch of the scripted index, with its directory and where it writes.
+    fn start_fetch() -> (tempfile::TempDir, String, IndexFetch) {
+        let directory = tempfile::tempdir().unwrap();
+        let partition_dir = directory.path().to_string_lossy().into_owned();
+        let index_path = format!("{partition_dir}/{START_OFFSET:020}.index");
+        let objects = Rc::new(Scripted {
+            index: index(),
+            etags: RefCell::new(vec!["a"; 3]),
+            asked: RefCell::default(),
+        });
+        let remote = RemoteSegments::new(objects, KeyLayout::new("iggy").unwrap());
+        let fetch = IndexFetch::start(
+            Rc::new(remote),
+            log(),
+            START_OFFSET,
+            partition_dir,
+            index_path.clone(),
+        );
+        (directory, index_path, fetch)
+    }
+
+    #[compio::test]
+    async fn given_a_started_fetch_when_no_poll_waits_should_still_write_the_index() {
+        let (_directory, index_path, fetch) = start_fetch();
+        let abandoned = fetch.wait();
+        drop(abandoned);
+        assert!(!fetch.is_over());
+
+        // The task is not polled through any waiter, only by the runtime.
+        for _turn in 0..5_000 {
+            if std::path::Path::new(&index_path).exists() {
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(std::fs::read(&index_path).unwrap(), index());
+        assert_eq!(fetch.wait().await, Some(Ok(())));
+        assert_eq!(fetch.wait().await, Some(Ok(())));
+        assert!(fetch.is_over());
+    }
+
+    #[compio::test]
+    async fn given_a_started_fetch_when_it_is_dropped_should_cancel_and_tell_its_waiters() {
+        let (_directory, index_path, fetch) = start_fetch();
+        let waiter = fetch.wait();
+        drop(fetch);
+
+        assert_eq!(waiter.await, None);
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!std::path::Path::new(&index_path).exists());
     }
 }

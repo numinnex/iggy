@@ -284,6 +284,9 @@ where
             *handle.fd.borrow_mut() = None;
             *handle.index.borrow_mut() = None;
             handle.offset_cursor.set(None);
+            // A fetch still running would write the index of the replaced
+            // segment over the files of the new one.
+            handle.index_fetch.borrow_mut().take();
         }
         self.sealed_lru.clear();
     }
