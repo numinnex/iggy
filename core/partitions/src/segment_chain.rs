@@ -33,6 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
+use std::path::Path;
 
 use compio::io::AsyncWriteAtExt;
 use consensus::state_artifact_checksum;
@@ -48,7 +49,7 @@ use tracing::warn;
 use crate::IggyPartition;
 use crate::segment::{Segment, SegmentLocation};
 use crate::state_transfer::{
-    ChunkHasher, OFFER_HASH_CHUNK_LEN, STAGING_SUFFIX, hash_segment_range,
+    ChunkHasher, OFFER_HASH_CHUNK_LEN, STAGING_SUFFIX, fsync_dir, hash_segment_range,
 };
 
 #[cfg(test)]
@@ -625,6 +626,70 @@ impl ChunkHasher for SegmentDigest {
     }
 }
 
+/// A chain reduced to its trim point and the latest record of every segment
+/// the trim point has not retired. Building it walks every record, so a reader
+/// that needs it more than once keeps it.
+pub(crate) struct LiveChain {
+    prefix: ObjectPrefix,
+    valid_len: u64,
+    trim_point: Option<u64>,
+    sealed: BTreeMap<u64, SegmentRecord>,
+    /// The segments in `sealed` whose latest record is remote.
+    remote: BTreeSet<u64>,
+}
+
+impl LiveChain {
+    pub(crate) fn new(chain: &Chain) -> Self {
+        let trim_point = chain.trim_point();
+        let mut latest: Vec<(&SegmentRecord, bool)> = chain
+            .records
+            .iter()
+            .filter_map(|record| {
+                let segment = record.segment()?;
+                trim_point
+                    .is_none_or(|trim_point| segment.end_offset > trim_point)
+                    .then_some((segment, matches!(record, ChainRecord::Remote(_))))
+            })
+            .collect();
+        // Sorted and deduplicated up front, so both collections below are
+        // built in one linear pass instead of an insert per record. The sort
+        // is stable and the walk is reversed, so the record kept for a start
+        // offset is the last the chain holds for it.
+        latest.sort_by_key(|(segment, _)| segment.start_offset);
+        latest.reverse();
+        latest.dedup_by_key(|(segment, _)| segment.start_offset);
+        latest.reverse();
+        Self {
+            prefix: chain.prefix,
+            valid_len: chain.valid_len,
+            trim_point,
+            sealed: latest
+                .iter()
+                .map(|(segment, _)| (segment.start_offset, **segment))
+                .collect(),
+            remote: latest
+                .iter()
+                .filter(|(_, remote)| *remote)
+                .map(|(segment, _)| segment.start_offset)
+                .collect(),
+        }
+    }
+
+    pub(crate) const fn trim_point(&self) -> Option<u64> {
+        self.trim_point
+    }
+
+    /// The segments whose latest record is remote, in offset order.
+    pub(crate) fn remote_segments(&self) -> Vec<SegmentRecord> {
+        let mut remote = self.remote.iter().peekable();
+        self.sealed
+            .iter()
+            .filter(|(start_offset, _)| remote.next_if_eq(start_offset).is_some())
+            .map(|(_, segment)| *segment)
+            .collect()
+    }
+}
+
 /// What a partition with a chain keeps of it between appends.
 pub(crate) struct SegmentChain {
     path: String,
@@ -749,13 +814,15 @@ async fn hash_step(
 /// The chain in `directory`, created holding `prefix` when there is none.
 async fn open(directory: &str, prefix: ObjectPrefix) -> Result<Chain, ChainError> {
     if let Some(chain) = read_chain(directory).await? {
-        return if chain.prefix == prefix {
-            Ok(chain)
-        } else {
-            Err(ChainError::Prefix {
+        if chain.prefix != prefix {
+            return Err(ChainError::Prefix {
                 recorded: chain.prefix,
-            })
-        };
+            });
+        }
+        // The chain may be here by a rename no directory sync followed, and
+        // a record appended to a name a power loss takes back is lost.
+        fsync_dir(directory).await?;
+        return Ok(chain);
     }
     create_chain(directory, &prefix).await?;
     Ok(Chain {
@@ -790,6 +857,8 @@ pub enum EvictionFailure {
     Record,
     /// The record is durable, but the `.log` is still there.
     Unlink,
+    /// The `.log` is unlinked, but a power loss may bring it back.
+    Sync,
 }
 
 impl EvictionJob {
@@ -810,14 +879,7 @@ impl EvictionJob {
             };
         }
         let outcome = match &messages_path {
-            Some(path) => match compio::fs::remove_file(path).await {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => {
-                    warn!(%path, start_offset, %error, "cannot unlink the evicted segment's log");
-                    Err(EvictionFailure::Unlink)
-                }
-            },
+            Some(path) => unlink_log(path, start_offset).await,
             None => Ok(()),
         };
         EvictionResult {
@@ -828,18 +890,32 @@ impl EvictionJob {
     }
 }
 
-impl SegmentChain {
-    fn load(path: String, chain: &Chain, active: Option<&Segment>) -> Self {
-        let mut sealed = BTreeMap::new();
-        let mut remote = BTreeSet::new();
-        for (start_offset, record) in chain.live_segments() {
-            if matches!(record, ChainRecord::Remote(_)) {
-                remote.insert(start_offset);
-            }
-            if let Some(segment) = record.segment() {
-                sealed.insert(start_offset, *segment);
-            }
+/// Unlink an evicted segment's `.log` and sync its directory before the next
+/// eviction may start. Without the sync a power loss could bring this `.log`
+/// back while a later one stays gone, and boot refuses a local segment in
+/// front of a remote one.
+async fn unlink_log(path: &str, start_offset: u64) -> Result<(), EvictionFailure> {
+    match compio::fs::remove_file(path).await {
+        Ok(()) => {}
+        // Gone already, by an unlink no directory sync is known to cover.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(%path, start_offset, %error, "cannot unlink the evicted segment's log");
+            return Err(EvictionFailure::Unlink);
         }
+    }
+    let directory = Path::new(path)
+        .parent()
+        .and_then(Path::to_str)
+        .ok_or(EvictionFailure::Sync)?;
+    fsync_dir(directory).await.map_err(|error| {
+        warn!(%path, start_offset, %error, "cannot sync the directory after unlinking the evicted segment's log");
+        EvictionFailure::Sync
+    })
+}
+
+impl SegmentChain {
+    fn load(path: String, chain: LiveChain, active: Option<&Segment>) -> Self {
         let digest = active
             .filter(|active| active.size.as_bytes_u64() == 0)
             .map(|active| Box::new(SegmentDigest::new(active.start_offset)));
@@ -847,10 +923,10 @@ impl SegmentChain {
             path,
             prefix: chain.prefix,
             valid_len: chain.valid_len,
-            sealed,
-            remote,
+            sealed: chain.sealed,
+            remote: chain.remote,
             confirmed: BTreeSet::new(),
-            trim_point: chain.trim_point(),
+            trim_point: chain.trim_point,
             digest,
         }
     }
@@ -900,11 +976,16 @@ impl SegmentChain {
     /// The chain as a state transfer carries it: the trim point and the latest
     /// record of every live segment, without the records a reader no longer
     /// needs.
-    fn snapshot(&self) -> Chain {
+    ///
+    /// A segment is remote only when `without_log`, ascending, holds its start
+    /// offset. The chain's own remote records do not decide it: an eviction cut
+    /// short after its record leaves the `.log` in place, and that segment
+    /// travels as bytes.
+    fn snapshot(&self, without_log: &[u64]) -> Chain {
         let mut records = Vec::with_capacity(self.sealed.len() + 1);
         records.extend(self.trim_point.map(ChainRecord::TrimPoint));
         records.extend(self.sealed.values().map(|segment| {
-            if self.remote.contains(&segment.start_offset) {
+            if without_log.binary_search(&segment.start_offset).is_ok() {
                 ChainRecord::Remote(*segment)
             } else {
                 ChainRecord::Sealed(*segment)
@@ -1051,6 +1132,11 @@ where
     /// [`ChainError::Prefix`] when the chain names another partition or
     /// incarnation.
     pub fn adopt_segment_chain(&mut self, chain: &Chain) -> Result<(), ChainError> {
+        self.adopt_live_chain(LiveChain::new(chain))
+    }
+
+    /// [`Self::adopt_segment_chain`] of a chain already reduced.
+    pub(crate) fn adopt_live_chain(&mut self, chain: LiveChain) -> Result<(), ChainError> {
         let directory = self
             .partition_dir
             .as_deref()
@@ -1089,8 +1175,12 @@ where
     }
 
     /// What a state transfer carries of the chain, `None` without one.
-    pub(crate) fn segment_chain_snapshot(&self) -> Option<Chain> {
-        self.segment_chain.as_ref().map(|chain| chain.snapshot())
+    /// `without_log` holds the start offsets of the segments the same transfer
+    /// sends no bytes for, ascending.
+    pub(crate) fn segment_chain_snapshot(&self, without_log: &[u64]) -> Option<Chain> {
+        self.segment_chain
+            .as_ref()
+            .map(|chain| chain.snapshot(without_log))
     }
 
     /// The object prefix the chain records, `None` without a chain.

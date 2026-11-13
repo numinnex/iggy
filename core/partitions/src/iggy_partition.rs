@@ -32,7 +32,7 @@ use crate::poll_plan::{
     PollTier, ResidentTailSnapshot, SegmentSource,
 };
 use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
-use crate::remote_segments::RemoteRange;
+use crate::remote_segments::{IndexFetches, RemoteRange};
 use crate::segment::{Segment, SegmentLocation};
 use crate::state_machine::StateMachines;
 use crate::state_transfer::{
@@ -182,6 +182,8 @@ where
     pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
     /// Where polls read segments whose `.log` left the disk.
     remote_segments: Option<Rc<crate::RemoteSegments>>,
+    /// The fetches of remote segments' indexes that polls have in flight.
+    index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
@@ -314,6 +316,9 @@ where
     poll_notifier: Option<Rc<dyn Fn()>>,
     /// The node's reserve on the data disk. `None` never refuses.
     free_space_reserve: Option<Arc<crate::FreeSpaceReserve>>,
+    /// Bytes of the send the reserve admitted and this partition is turning
+    /// into a prepare. The reserve counts them as pending until the WAL does.
+    admitted_send_bytes: Cell<u64>,
     /// Committed consumer-offset membership and values. This is deliberately
     /// separate from the eager poll maps because follower-local and uncommitted
     /// auto-commit progress must never consume a durable slot or enter a state
@@ -764,8 +769,8 @@ struct PendingPartitionMaintenance {
     checkpoint: Option<PendingCheckpoint>,
     retention: Option<u64>,
     removing: Option<Segment>,
-    /// The removal appends a trim point at the removed segment's end.
-    removal_trim: bool,
+    /// The trim point the removal appends before it unlinks.
+    removal_trim: Option<u64>,
     eviction: Option<u64>,
     tiering: Option<PendingTiering>,
 }
@@ -944,6 +949,9 @@ impl<B: MessageBus, SB> Drop for IggyPartition<B, SB> {
         if let Some(persistence) = &self.persistence {
             persistence.retire();
         }
+        if let Some(reserve) = &self.free_space_reserve {
+            reserve.release_pending(self.admitted_send_bytes.take());
+        }
     }
 }
 
@@ -956,6 +964,8 @@ where
     pub fn new(stats: Arc<PartitionStats>, consensus: VsrConsensus<B>) -> Self {
         let observed_view = consensus.view();
         let single_replica = consensus.replica_count() == 1;
+        let io_active = Rc::<crate::io::PartitionIoQuiescence>::default();
+        let poll_history = PollHistoryId::default();
         let partition = Self {
             consensus,
             dedup: ClientTable::with_mode(
@@ -979,6 +989,7 @@ where
             state_machines: StateMachines::default(),
             segment_chain: None,
             remote_segments: None,
+            index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
             committed_bytes: 0,
@@ -1023,14 +1034,15 @@ where
             io_notifier: RefCell::new(None),
             io_bytes_max: Cell::new(isize::MAX as usize),
             io_sequence: Cell::new(0),
-            io_active: Rc::default(),
+            io_active,
             transition: None,
             deferred_views: Vec::new(),
-            poll_history: PollHistoryId::default(),
+            poll_history,
             incarnation: crate::PartitionIncarnation::default(),
             workerless_offset_files: Rc::default(),
             poll_notifier: None,
             free_space_reserve: None,
+            admitted_send_bytes: Cell::new(0),
             durable_consumer_offsets: DurableConsumerOffsets::default(),
             explicit_offset_stores: ExplicitOffsetStores::default(),
             consumer_offset_capacities: ConsumerKind::ALL
@@ -1860,6 +1872,7 @@ where
         self.workerless_offset_files.clear();
         if self.materialization_missing {
             self.persistence = Some(persistence);
+            self.report_wal_backlog_to_reserve();
             self.consensus.resume_adopted_view();
             return Ok(());
         }
@@ -1909,6 +1922,7 @@ where
             });
         }
         self.persistence = Some(persistence);
+        self.report_wal_backlog_to_reserve();
         self.consensus.resume_adopted_view();
         Ok(())
     }
@@ -2139,13 +2153,15 @@ where
                     .sum::<usize>(),
         );
         for start_offset in segments {
-            // Retention may already have removed a dirty sealed segment.
-            if self
+            // Retention may already have removed a dirty sealed segment, and
+            // an evicted one has no `.log` left to sync: boot marks every
+            // recovered segment dirty, remote ones included.
+            let local = self
                 .log
                 .segments()
                 .binary_search_by_key(&start_offset, |segment| segment.start_offset)
-                .is_err()
-            {
+                .is_ok_and(|slot| self.log.segments()[slot].location != SegmentLocation::Remote);
+            if !local {
                 continue;
             }
             paths.push(config.get_messages_path(
@@ -3329,6 +3345,7 @@ where
             self.consensus.set_recovery_election_allowed(true);
         }
         self.persistence = Some(persistence);
+        self.report_wal_backlog_to_reserve();
         self.start_persistence();
     }
 
@@ -4503,6 +4520,11 @@ where
                 return Err(IggyError::TransientNotAccepted);
             }
         }
+        // Only now: the store failing a read of a history or an owner that
+        // was replaced meanwhile says nothing about the ones served now.
+        if let Some(error) = result.tiered_read_failure() {
+            return Err(error);
+        }
         let mut replication = None;
         if let Some(offset) = result
             .last_matching_offset
@@ -4576,6 +4598,7 @@ where
     pub(crate) fn invalidate_poll_history(&mut self) {
         self.workerless_offset_files.clear();
         self.poll_history = PollHistoryId::default();
+        self.index_fetches.replace_history(self.poll_history);
         self.publish_poll_visibility();
         self.discard_queued_auto_commits();
         self.transfer_plan.borrow_mut().take();
@@ -4607,7 +4630,54 @@ where
     /// primary. A backup keeps journalling, because a replica that refuses
     /// prepares stalls the commit of every group that needs its ack.
     pub fn set_free_space_reserve(&mut self, reserve: Option<Arc<crate::FreeSpaceReserve>>) {
+        self.release_send_space();
         self.free_space_reserve = reserve;
+        self.report_wal_backlog_to_reserve();
+    }
+
+    /// The WAL counts what it accepted and has not written as pending bytes
+    /// of the reserve. Call after either of the two is installed.
+    fn report_wal_backlog_to_reserve(&self) {
+        if let Some(persistence) = &self.persistence {
+            persistence.report_pending_bytes_to(self.free_space_reserve.as_ref());
+        }
+    }
+
+    /// Whether the reserve leaves room for this send. Its bytes stay pending
+    /// until [`Self::release_send_space`], so no other partition of the node
+    /// is given the same room while this one awaits.
+    ///
+    /// A batch the partition already holds passes a short disk: its sender
+    /// is owed the outcome, and answering it takes no new space.
+    fn reserve_send_space(&self, message: &Message<RoutedRequestHeader>) -> bool {
+        let Some(reserve) = &self.free_space_reserve else {
+            return true;
+        };
+        self.release_send_space();
+        let frame_bytes = Self::prepared_request_size(message) as u64;
+        if reserve.admit(frame_bytes) {
+            self.admitted_send_bytes.set(frame_bytes);
+            return true;
+        }
+        if matches!(
+            self.check_producer_batch(message),
+            Ok(ProducerAdmission::Duplicate { .. } | ProducerAdmission::DuplicateInFlight)
+        ) {
+            return true;
+        }
+        reserve.count_refusal();
+        false
+    }
+
+    /// Call once the admitted send is a prepare in the WAL queue, which
+    /// counts it from then on, or was refused or queued on the way there.
+    fn release_send_space(&self) {
+        let admitted = self.admitted_send_bytes.take();
+        if admitted > 0
+            && let Some(reserve) = &self.free_space_reserve
+        {
+            reserve.release_pending(admitted);
+        }
     }
 
     pub(crate) fn publish_poll_visibility(&self) {
@@ -6080,6 +6150,7 @@ where
             partition_dir: self.partition_dir_resolution(),
             remote: self.remote_segments.clone(),
             object_prefix,
+            index_fetches: self.index_fetches.fence(),
             segments,
             cut,
             deadline: None,
@@ -7575,10 +7646,7 @@ where
         let segments = self.log.segments();
         match query {
             MessageLookup::Offset { offset, .. } => {
-                let segment_index = segments
-                    .iter()
-                    .rposition(|segment| segment.start_offset <= *offset)
-                    .unwrap_or(0);
+                let segment_index = segment_holding(segments, *offset);
                 let entry = self
                     .log
                     .segment_indexes(segment_index)
@@ -7629,8 +7697,18 @@ where
     /// # Panics
     /// Panics if called when this partition's consensus instance is not the
     /// primary, is not in normal status, or is currently syncing.
-    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    #[allow(clippy::future_not_send)]
     pub async fn on_request(
+        &mut self,
+        message: Message<RoutedRequestHeader>,
+        reply: Option<consensus::Sender<Message<ReplyHeader>>>,
+    ) {
+        self.admit_request(message, reply).await;
+        self.release_send_space();
+    }
+
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn admit_request(
         &mut self,
         message: Message<RoutedRequestHeader>,
         reply: Option<consensus::Sender<Message<ReplyHeader>>>,
@@ -7760,25 +7838,6 @@ where
                     message.header(),
                     IggyError::HistoryUnavailable.as_code(),
                     "request history is no longer available",
-                    reply.take(),
-                )
-                .await;
-                return;
-            }
-            // Only messages grow the disk without bound. Offsets, segment
-            // deletion and every other operation stay admitted, so a consumer
-            // and retention can still make room.
-            if message.header().operation == Operation::SendMessages
-                && self
-                    .free_space_reserve
-                    .as_ref()
-                    .is_some_and(|reserve| reserve.refuses_messages())
-            {
-                Self::send_partition_deny_or_log(
-                    consensus,
-                    message.header(),
-                    IggyError::TransientNotAccepted.as_code(),
-                    "data disk is below its free-space reserve",
                     reply.take(),
                 )
                 .await;
@@ -8234,6 +8293,25 @@ where
                     .await;
                     return;
                 }
+            }
+
+            // Only messages grow the disk without bound. Offsets, segment
+            // deletion and every other operation stay admitted, so a consumer
+            // and retention can still make room. Below the dedup lookup: a
+            // retry is owed the outcome of its original, which this refusal
+            // would replace with a claim that nothing was admitted.
+            if message.header().operation == Operation::SendMessages
+                && !self.reserve_send_space(&message)
+            {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "data disk is below its free-space reserve",
+                    reply.take(),
+                )
+                .await;
+                return;
             }
 
             // A group's offsets wait for its installation, or they would land
@@ -8743,6 +8821,25 @@ where
                 }
                 continue;
             }
+            // The disk can fall short while a send waits in the queue. It
+            // holds no op yet, so its client can safely retry it.
+            if header.operation == Operation::SendMessages
+                && !self.reserve_send_space(&request.message)
+            {
+                if self
+                    .deny_queued_request(
+                        &header,
+                        IggyError::TransientNotAccepted.as_code(),
+                        "data disk fell below its free-space reserve",
+                        reply_sender.take(),
+                        &mut consecutive_denials,
+                    )
+                    .await
+                {
+                    break;
+                }
+                continue;
+            }
             consecutive_denials = 0;
             if queued_install.is_some() {
                 self.pending_owner_install.set(queued_install);
@@ -8750,6 +8847,7 @@ where
             let prepare = self.pipeline_local_request(request.message, reply_sender, order);
             promoted += 1;
             self.on_replicate(prepare).await;
+            self.release_send_space();
             drop(context);
         }
         self.drain_no_ack().await;
@@ -12932,18 +13030,36 @@ where
             .inner
             .forget_segment(segment.start_offset);
         let (messages, indexes) = storage.segment_and_index_paths();
+        // A segment that came here remote has no `.index` in its storage, and
+        // a poll may have fetched one since or be fetching it now.
+        self.index_fetches.retire_through(segment.end_offset);
+        let indexes = indexes.or_else(|| {
+            let dir = self.partition_dir.as_deref()?;
+            (segment.location == SegmentLocation::Remote)
+                .then(|| format!("{dir}/{:0>20}.index", segment.start_offset))
+        });
         let anchor = self.anchor_cleanup_path(segment.start_offset);
         self.segment_checksum_cache
             .borrow_mut()
             .remove(&segment.start_offset);
         // Boot refuses a front above the trim point, and keeps no record at or
         // below it, so the trim point must cover the segment before it goes.
+        // It runs up to the next segment: the anchor that certifies a gap
+        // between the two names the segment leaving now, so past this removal
+        // only the trim point vouches for the new front.
+        let trim_point = self
+            .log
+            .segments()
+            .first()
+            .map_or(segment.end_offset, |next| {
+                next.start_offset.saturating_sub(1).max(segment.end_offset)
+            });
         let trim = self
             .segment_chain
             .as_ref()
-            .and_then(|chain| chain.trim(segment.end_offset))
+            .and_then(|chain| chain.trim(trim_point))
             .map(Box::new);
-        self.maintenance.removal_trim = trim.is_some();
+        self.maintenance.removal_trim = trim.as_ref().map(|_| trim_point);
         self.maintenance.removing = Some(segment);
         self.clear_state_transfer_offer_cache();
         Some(crate::PartitionIoJob::RemoveSegment {
@@ -12957,15 +13073,13 @@ where
     }
 
     fn accept_segment_removal(&mut self, result: &crate::PartitionIoResult) -> Option<u64> {
-        let trimmed = std::mem::take(&mut self.maintenance.removal_trim);
+        let trim_point = self.maintenance.removal_trim.take();
         if !matches!(result, crate::PartitionIoResult::SegmentRemoved(Ok(()))) {
             return None;
         }
         let segment = self.maintenance.removing.take()?;
-        if trimmed && let Some(chain) = self.segment_chain.as_mut() {
-            chain.note_appended(&crate::segment_chain::ChainRecord::TrimPoint(
-                segment.end_offset,
-            ));
+        if let (Some(trim_point), Some(chain)) = (trim_point, self.segment_chain.as_mut()) {
+            chain.note_appended(&crate::segment_chain::ChainRecord::TrimPoint(trim_point));
         }
         let (messages, shortfall) = settle_cleaned_segment(&self.stats, &segment);
         shortfall.report(
@@ -13268,11 +13382,10 @@ where
 
     fn eviction_is_ready(&mut self, through: u64) -> bool {
         let segments = self.log.segments();
+        let slot = self.first_local_slot();
         let next = segments
-            .iter()
-            .position(|segment| segment.location != SegmentLocation::Remote)
-            .filter(|slot| slot + 1 < segments.len())
-            .map(|slot| &segments[slot])
+            .get(slot)
+            .filter(|_| slot + 1 < segments.len())
             .filter(|segment| {
                 segment.sealed
                     && segment.end_offset <= through
@@ -13300,13 +13413,18 @@ where
         true
     }
 
-    fn capture_segment_eviction(&self) -> Option<crate::PartitionIoJob<SB>> {
-        let slot = self
-            .log
+    /// The slot of the first segment still on local disk. Remote segments are
+    /// always the front of the list, so a binary search finds where they end
+    /// without walking a prefix that grows with every eviction.
+    fn first_local_slot(&self) -> usize {
+        self.log
             .segments()
-            .iter()
-            .position(|segment| segment.location != SegmentLocation::Remote)?;
-        let start_offset = self.log.segments()[slot].start_offset;
+            .partition_point(|segment| segment.location == SegmentLocation::Remote)
+    }
+
+    fn capture_segment_eviction(&self) -> Option<crate::PartitionIoJob<SB>> {
+        let slot = self.first_local_slot();
+        let start_offset = self.log.segments().get(slot)?.start_offset;
         let messages_path = self.log.storages()[slot].segment_and_index_paths().0;
         let job = self
             .segment_chain
@@ -13320,9 +13438,9 @@ where
     /// as retention does after an unlink. Returns whether the segment left the
     /// disk.
     ///
-    /// A record that may not be durable fails like any other durability
-    /// failure. A failed unlink only ends the pass: the record is durable, so
-    /// the next pass retries the unlink alone.
+    /// A record or an unlink that may not be durable fails like any other
+    /// durability failure. A failed unlink only ends the pass: the record is
+    /// durable, so the next pass retries the unlink alone.
     fn accept_segment_eviction(
         &mut self,
         result: crate::PartitionIoResult,
@@ -13344,6 +13462,9 @@ where
             }
             Err(crate::segment_chain::EvictionFailure::Record) => {
                 return Err(IggyError::CannotWriteToFile);
+            }
+            Err(crate::segment_chain::EvictionFailure::Sync) => {
+                return Err(IggyError::CannotSyncFile);
             }
         }
         let slot = self
@@ -14980,6 +15101,17 @@ fn leading_expired_end(
         up_to = Some(segment.end_offset);
     }
     up_to
+}
+
+/// Index of the last of `segments` that starts at or below `offset`, or of the
+/// first one when they all start above it.
+///
+/// Segments are ordered by start offset, and remote ones make the list as
+/// long as total retention, so the lookup must not cost a step per segment.
+fn segment_holding(segments: &[Segment], offset: u64) -> usize {
+    segments
+        .partition_point(|segment| segment.start_offset <= offset)
+        .saturating_sub(1)
 }
 
 /// How many of `segments`, a poll's starting segment and the ones after it,

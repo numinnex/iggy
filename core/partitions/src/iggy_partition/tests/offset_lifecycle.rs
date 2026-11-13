@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::remote_segments::IndexFetchFence;
 
 /// A replica applies the delete fence from its partition log, and its
 /// metadata can apply the delete later. Until then reads planned before or
@@ -559,6 +560,7 @@ async fn given_in_flight_sealed_poll_when_state_is_installed_should_wipe_its_rea
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         deadline: None,
         bytes_per_message: None,

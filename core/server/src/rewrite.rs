@@ -534,9 +534,8 @@ where
         user_id.filter(|user_id| may_update(streams, users, *user_id, &patch.target));
     let current = authorized_user_id.and_then(|_| stored_options(streams, users, &patch.target));
     let stored_state_visible = current.is_some();
-    let patched_from = matches!(patch.target, ResourceTarget::Topic { .. })
-        .then(|| current.clone())
-        .flatten();
+    let is_topic_patch = matches!(patch.target, ResourceTarget::Topic { .. });
+    let patched_from = is_topic_patch.then(|| current.clone()).flatten();
     let admitted = admit_patch(patch, current)?;
     if let Some(current) = patched_from {
         // A rule between two keys reads the one this patch leaves alone from
@@ -961,6 +960,121 @@ mod tests {
         .map(|_| ());
         assert_eq!(tcp, Err(expected.clone()), "binary chain");
         assert_eq!(http, Err(expected), "HTTP chain");
+    }
+
+    /// The edge rules on the request alone, so a patch that turns tiered
+    /// storage on passes both chains whether or not its topic exists or its
+    /// caller may see it. The metadata primary refuses it as a reply, which
+    /// leaves the session in place: an eviction here would disconnect a client
+    /// for naming a topic it cannot know to be missing.
+    #[compio::test]
+    async fn given_tiered_storage_on_when_patching_a_missing_or_hidden_topic_should_be_refused_by_the_primary_as_a_reply()
+     {
+        const READER: u32 = 1;
+        const MISSING_TOPIC: u32 = 99;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        let created = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateUser,
+                1,
+                3,
+                &create_reader_request().to_bytes(),
+            ))
+            .expect("the reader is created");
+        assert_eq!(created.code, 0);
+        let sessions = root_sessions(&shard, 1);
+        let patch = |topic_id: u32, key: OptionKey, value: &str| {
+            let patch = TopicUpdateOptions {
+                raw: BTreeMap::from([(key.to_string(), value.to_owned())]),
+                ..TopicUpdateOptions::default()
+            }
+            .to_patch()
+            .expect("the patch encodes");
+            UpdateResourceRequest {
+                target: ResourceTarget::Topic {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(topic_id),
+                },
+                reset: patch.reset,
+                options: patch.set,
+            }
+            .to_bytes()
+        };
+        let http = |user_id: u32, body: &Bytes| {
+            http_chain(
+                &shard,
+                user_id,
+                request_message(Operation::UpdateResource, 1, 1, 1, body),
+            )
+            .map(|(admitted, _)| admitted)
+        };
+
+        let missing = patch(MISSING_TOPIC, OptionKey::TieredStorage, "true");
+        let hidden = patch(0, OptionKey::TieredStorage, "true");
+        let tcp = tcp_chain(
+            &shard,
+            &sessions,
+            1,
+            request_message(Operation::UpdateResource, 1, 1, 1, &missing),
+        );
+        assert!(tcp.is_ok(), "binary chain");
+        let metadata = shard.plane.metadata();
+        let refused = [
+            (DEFAULT_ROOT_USER_ID, &missing, "a missing topic"),
+            (READER, &hidden, "a hidden topic"),
+        ];
+
+        assert!(!metadata.tiered_storage_cluster_ready());
+        for (user_id, body, case) in refused {
+            let admitted = http(user_id, body).unwrap_or_else(|error| panic!("{case}: {error}"));
+            let reply = metadata
+                .submit_request_in_process(admitted)
+                .await
+                .expect("the primary answers");
+            assert_eq!(reply.header().command, Command::Reply, "{case}");
+            assert_eq!(
+                iggy_binary_protocol::result_code(reply.body()),
+                Some(IggyError::FeatureUnavailable.as_code()),
+                "{case}"
+            );
+        }
+
+        // A cluster that can tier leaves the target to apply, which answers
+        // a missing topic with a result as for any other patch of it.
+        let admitted = http(DEFAULT_ROOT_USER_ID, &missing).expect("the patch is admitted");
+        let admitted = UpdateResourceRequest::decode_from(crate::wire::request_body(&admitted))
+            .expect("the admitted patch decodes");
+        let resolved = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(MISSING_TOPIC),
+            name: None,
+            explicit_options: admitted.options,
+            derived_options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let applied = metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::UpdateTopicResolved,
+                1,
+                4,
+                &resolved,
+            ))
+            .expect("apply answers with a result");
+        assert_ne!(applied.code, 0);
+        // Without the option the missing topic stays the apply's to report.
+        assert!(
+            http(
+                DEFAULT_ROOT_USER_ID,
+                &patch(MISSING_TOPIC, OptionKey::MessageExpiry, "1h")
+            )
+            .is_ok()
+        );
     }
 
     /// The rule spans two keys, so a patch of either one must meet it against
