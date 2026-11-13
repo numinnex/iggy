@@ -1176,10 +1176,12 @@ public actor PartitionReader: AsyncSequence {
             }
             if configuration.options.commitsOnRead {
                 let now = ContinuousClock.now
-                // A sync beside the reads can take a partition away meanwhile.
+                resumeUnblocked()
+                // A sync beside the reads can take a partition away meanwhile. A stopped partition reads nothing
+                // until a seek, and a lookup of it would send the refused read again on each pass.
                 for partition in assigned.sorted()
                 where assigned.contains(partition) && activeReads[partition] == nil && (pausedUntil[partition] ?? now) <= now
-                    && awaitingLookup[partition] == nil
+                    && awaitingLookup[partition] == nil && !stopped.contains(partition)
                 {
                     // The close waits for this call, so a lookup after the close start only delays it.
                     guard !isClosed else {
@@ -1591,14 +1593,20 @@ public actor PartitionReader: AsyncSequence {
         }
         let now = ContinuousClock.now
         pausedUntil = pausedUntil.filter { $0.value > now }
-        for (partition, operation) in blockedBy where !client.core.pollRouter.retainsFetch(operation) {
-            blockedBy[partition] = nil
-            stopped.remove(partition)
-        }
+        resumeUnblocked()
         if !configuration.options.commitsOnRead || onDemand {
             fetchAhead()
         }
         pollSingles()
+    }
+
+    /// Resumes the partitions that a lost committing read blocked once that
+    /// read was abandoned.
+    private func resumeUnblocked() {
+        for (partition, operation) in blockedBy where !client.core.pollRouter.retainsFetch(operation) {
+            blockedBy[partition] = nil
+            stopped.remove(partition)
+        }
     }
 
     /// With `onRead` a read goes out only for a reader that waits with

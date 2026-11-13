@@ -3987,6 +3987,39 @@ struct ConsumerTests {
         await server.stop()
     }
 
+    /// With `onRead` a partition that reads at `next` reads a baseline
+    /// before its first committing read. A baseline that the object store
+    /// refuses for good stops the partition, so a later `next()` sends no
+    /// baseline read again until a seek.
+    @Test func aBaselineReadRefusedWithTieredReadFailedIsNotSentAgainByALaterNext() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 2])
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.fetchMessages.rawValue, let fetch = try? request.fetch else {
+                return nil
+            }
+            return .ok(
+                FakeVSRServer.fetchedBody(
+                    fetch.targets.map { FakeVSRServer.FetchedSection(partitionID: $0.partitionID, status: IggyErrorCode.tieredReadFailed.rawValue) }))
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, commit: .onRead)
+
+        let error = await readError(reader)
+        #expect(error?.partitionID == 1 && error?.error.code == .tieredReadFailed)
+        #expect(error?.stopsPartition == true)
+        let later = Task { try? await reader.next() }
+        // Several retry intervals of the reader pass.
+        try await Task.sleep(for: .milliseconds(400))
+
+        #expect(await requests(server, .fetchMessages).count == 1)
+        later.cancel()
+        _ = await later.value
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
     /// A fetch reply takes one record past `maxBytes`. A section refused for
     /// its first message is read with a poll of its own, which returns that
     /// message alone with the same limits.
