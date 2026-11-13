@@ -47,7 +47,9 @@ use tracing::warn;
 
 use crate::IggyPartition;
 use crate::segment::{Segment, SegmentLocation};
-use crate::state_transfer::{ChunkHasher, STAGING_SUFFIX, hash_segment_range};
+use crate::state_transfer::{
+    ChunkHasher, OFFER_HASH_CHUNK_LEN, STAGING_SUFFIX, hash_segment_range,
+};
 
 #[cfg(test)]
 mod tests;
@@ -595,6 +597,25 @@ impl SegmentDigest {
     pub fn finalize(&self) -> SegmentHashes {
         self.hasher.finalize()
     }
+
+    /// Whether the digest holds the first bytes of the segment starting at
+    /// `start_offset` and not yet all `size` of them.
+    pub(crate) const fn resumes(&self, start_offset: u64, size: u64) -> bool {
+        self.start_offset == start_offset && self.hashed_len < size
+    }
+
+    /// Whether this is the digest `captured` was before a step of the same
+    /// segment's hash.
+    pub(crate) const fn continues(&self, captured: &Self) -> bool {
+        self.start_offset == captured.start_offset && self.hashed_len > captured.hashed_len
+    }
+
+    /// Bytes the next step of a hash from disk reads of a segment of `size`
+    /// bytes, which is the buffer the step allocates.
+    pub(crate) fn step_len(&self, size: u64) -> usize {
+        usize::try_from(size.saturating_sub(self.hashed_len))
+            .map_or(HASH_STEP_LEN, |left| left.min(HASH_STEP_LEN))
+    }
 }
 
 impl ChunkHasher for SegmentDigest {
@@ -661,17 +682,25 @@ pub enum TieringJob {
     },
     /// Record the front that retention had left before tiering was enabled.
     Trim(ChainAppend),
-    /// Hash a sealed segment that has no record from its `.log`, and record
-    /// it. `append` holds the record with a zero hash.
+    /// Hash the next [`HASH_STEP_LEN`] bytes of a sealed segment that has no
+    /// record from its `.log`, and record the segment once `digest` holds all
+    /// of it. `append` holds the record with a zero hash.
     Hash {
         log_path: String,
         append: ChainAppend,
+        digest: Box<SegmentDigest>,
     },
 }
+
+/// Bytes one step of a hash from disk reads. A step is one job on the
+/// partition's I/O lane, so this bounds how long other work waits behind it.
+pub(crate) const HASH_STEP_LEN: usize = OFFER_HASH_CHUNK_LEN;
 
 pub enum TieringResult {
     Opened(Result<Chain, ChainError>),
     Appended(io::Result<ChainRecord>),
+    /// The digest after a step that left bytes of the segment unread.
+    Hashed(Box<SegmentDigest>),
 }
 
 impl TieringJob {
@@ -685,20 +714,36 @@ impl TieringJob {
             }
             Self::Hash {
                 log_path,
-                mut append,
-            } => TieringResult::Appended(
-                async {
-                    if let ChainRecord::Sealed(segment) = &mut append.record {
-                        let hashes = hash_segment_file(&log_path, segment.size).await?;
-                        segment.hash = hashes.blake3;
-                        segment.crc32c = hashes.crc32c;
-                    }
-                    append.execute().await.map(|()| append.record)
-                }
-                .await,
-            ),
+                append,
+                digest,
+            } => hash_step(&log_path, append, digest)
+                .await
+                .unwrap_or_else(|error| TieringResult::Appended(Err(error))),
         }
     }
+}
+
+async fn hash_step(
+    log_path: &str,
+    mut append: ChainAppend,
+    mut digest: Box<SegmentDigest>,
+) -> io::Result<TieringResult> {
+    let ChainRecord::Sealed(segment) = &mut append.record else {
+        return Err(io::Error::other(
+            "a hash from disk records a sealed segment",
+        ));
+    };
+    let from = digest.hashed_len;
+    let to = from + digest.step_len(segment.size) as u64;
+    hash_segment_range(log_path, from, to, &mut *digest, None).await?;
+    if !digest.covers(segment.start_offset, segment.size) {
+        return Ok(TieringResult::Hashed(digest));
+    }
+    let hashes = digest.finalize();
+    segment.hash = hashes.blake3;
+    segment.crc32c = hashes.crc32c;
+    append.execute().await?;
+    Ok(TieringResult::Appended(Ok(append.record)))
 }
 
 /// The chain in `directory`, created holding `prefix` when there is none.
@@ -908,6 +953,15 @@ impl SegmentChain {
         })
     }
 
+    /// Whether the chain holds neither a record of `segment` nor a trim point
+    /// that retires it.
+    pub(crate) fn lacks_record(&self, segment: &Segment) -> bool {
+        !self.sealed.contains_key(&segment.start_offset)
+            && self
+                .trim_point
+                .is_none_or(|trim_point| segment.end_offset > trim_point)
+    }
+
     /// The record of `segment` hashed from disk, with the hash still to fill
     /// in, `None` when the chain already records the segment.
     pub(crate) fn hash_from_disk(
@@ -915,11 +969,7 @@ impl SegmentChain {
         segment: &Segment,
         incarnation: u64,
     ) -> Option<ChainAppend> {
-        if self.sealed.contains_key(&segment.start_offset)
-            || self
-                .trim_point
-                .is_some_and(|trim_point| segment.end_offset <= trim_point)
-        {
+        if !self.lacks_record(segment) {
             return None;
         }
         Some(self.append(ChainRecord::Sealed(SegmentRecord::new(
@@ -1035,6 +1085,7 @@ where
     /// and its sweep replaces or removes the file.
     pub(crate) fn drop_segment_chain(&mut self) {
         self.segment_chain = None;
+        self.restart_tiering();
     }
 
     /// What a state transfer carries of the chain, `None` without one.
