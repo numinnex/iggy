@@ -199,7 +199,7 @@ where
                 .borrow_mut()
                 .admit(namespace, created_revision, bytes, now)
         };
-        let Some((upload, scope)) = partition.begin_segment_upload_if(admit) else {
+        let Some((upload, scope, attempt)) = partition.begin_segment_upload_if(admit) else {
             return;
         };
         let record = upload.record;
@@ -210,6 +210,7 @@ where
             let finished = Box::new(FinishedSegmentUpload {
                 namespace,
                 created_revision,
+                attempt,
                 record,
                 outcome: uploader.upload(upload, scope).await,
             });
@@ -266,7 +267,9 @@ where
     ///
     /// The outcome also sets how long the partition waits before its next
     /// attempt, counted from `now`. A cancelled upload says nothing about the
-    /// store, so it changes no wait.
+    /// store, so it changes no wait. Neither does the result of an attempt
+    /// the partition gave up: the attempt that replaced it is the one whose
+    /// outcome counts.
     #[allow(clippy::future_not_send)]
     async fn settle_segment_upload(&self, finished: FinishedSegmentUpload, now: Instant) -> bool
     where
@@ -279,7 +282,10 @@ where
             .plane
             .partitions()
             .get_mut_by_ns(&finished.namespace)
-            .filter(|partition| partition.created_revision() == finished.created_revision)
+            .filter(|partition| {
+                partition.created_revision() == finished.created_revision
+                    && partition.segment_upload_attempt() == Some(finished.attempt)
+            })
             .and_then(|partition| {
                 let mut pacing = self.upload_pacing.borrow_mut();
                 match &finished.outcome {
@@ -293,8 +299,11 @@ where
                     Err(_) => {}
                 }
                 drop(pacing);
-                let advance =
-                    partition.finish_segment_upload(&finished.record, &finished.outcome)?;
+                let advance = partition.finish_segment_upload(
+                    finished.attempt,
+                    &finished.record,
+                    &finished.outcome,
+                )?;
                 self.floor_advance_request(finished.namespace, partition, &advance)
             });
         let Some(request) = request else {

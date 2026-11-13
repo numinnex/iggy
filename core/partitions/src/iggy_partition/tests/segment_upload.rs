@@ -28,7 +28,7 @@ use crate::{
 use iggy_common::{IggyExpiry, IggyTimestamp};
 use iggy_object_store::{
     InlineTierExecutor, MemoryStore, ObjectStore, ObjectStoreError, PutBody, PutOptions,
-    SegmentKey, SegmentMetadata, SegmentObject,
+    SegmentKey, SegmentMetadata, SegmentObject, TierJobCancelled,
 };
 use std::cell::Cell;
 use std::time::Duration;
@@ -174,6 +174,51 @@ async fn given_a_damaged_log_when_uploading_should_fail_before_anything_reaches_
             ..
         })
     ));
+    assert!(store.is_empty());
+}
+
+const BATCH_LENGTH_OFFSET: usize = 32;
+
+fn batch_length(log: &[u8], batch_at: usize) -> u64 {
+    let at = batch_at + BATCH_LENGTH_OFFSET;
+    u64::from_le_bytes(log[at..at + 8].try_into().unwrap())
+}
+
+/// A length that reaches past the segment cannot be waited for: the bytes up
+/// to it are the rest of the file.
+#[compio::test]
+async fn given_a_batch_length_beyond_the_segment_when_uploading_should_fail_at_its_header() {
+    let (_directory, partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let store = MemoryStore::new();
+    let next = partition.next_segment_upload().unwrap();
+    let log = std::fs::read(&next.log_path).unwrap();
+    let second_at = usize::try_from(batch_length(&log, 0)).unwrap();
+    assert!((second_at as u64) < next.record.size, "two batches");
+
+    for (batch_at, length) in [
+        (0, next.record.size + 1),
+        (second_at, next.record.size - second_at as u64 + 1),
+        (second_at, u64::MAX),
+    ] {
+        let mut damaged = log.clone();
+        let at = batch_at + BATCH_LENGTH_OFFSET;
+        damaged[at..at + 8].copy_from_slice(&length.to_le_bytes());
+        std::fs::write(&next.log_path, damaged).unwrap();
+
+        let failure = upload(&store, &next).await.unwrap_err();
+
+        assert!(
+            matches!(
+                failure,
+                UploadError::MediaFault {
+                    reason: "a batch is longer than a batch can be",
+                    ..
+                }
+            ),
+            "{failure}"
+        );
+    }
     assert!(store.is_empty());
 }
 
@@ -453,7 +498,7 @@ async fn given_a_primary_when_uploads_run_should_keep_one_in_flight_and_yield_ea
     assert!(partition.consensus.is_primary(), "the fixture is a primary");
     let uploader = uploader(MemoryStore::new());
 
-    let (first, scope) = partition.begin_segment_upload().unwrap();
+    let (first, scope, attempt) = partition.begin_segment_upload().unwrap();
     assert_eq!(first.record.start_offset, 0);
     assert!(
         partition.begin_segment_upload().is_none(),
@@ -463,17 +508,17 @@ async fn given_a_primary_when_uploads_run_should_keep_one_in_flight_and_yield_ea
     assert!(matches!(outcome, Ok(Ok(()))));
 
     let advance = partition
-        .finish_segment_upload(&first.record, &outcome)
+        .finish_segment_upload(attempt, &first.record, &outcome)
         .unwrap();
     assert_eq!((advance.start, advance.up_to), (0, 1));
     assert_eq!(advance.hash, first.record.hash);
     // A result that arrives twice is not an upload this partition waits for.
     assert_eq!(
-        partition.finish_segment_upload(&first.record, &outcome),
+        partition.finish_segment_upload(attempt, &first.record, &outcome),
         None
     );
 
-    let (second, _scope) = partition.begin_segment_upload().unwrap();
+    let (second, _scope, _attempt) = partition.begin_segment_upload().unwrap();
     assert_eq!(second.record.start_offset, 2);
 }
 
@@ -483,16 +528,16 @@ async fn given_an_upload_that_fails_when_it_finishes_should_offer_the_segment_ag
         Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
     let uploader = uploader(Refusing::default());
 
-    let (first, scope) = partition.begin_segment_upload().unwrap();
+    let (first, scope, attempt) = partition.begin_segment_upload().unwrap();
     let outcome = uploader.upload(first.clone(), scope).await;
     assert!(matches!(&outcome, Ok(Err(failure)) if failure.is_transient()));
 
     assert_eq!(
-        partition.finish_segment_upload(&first.record, &outcome),
+        partition.finish_segment_upload(attempt, &first.record, &outcome),
         None
     );
     assert_eq!(local_starts(&partition), [0, 2]);
-    let (again, _scope) = partition.begin_segment_upload().unwrap();
+    let (again, _scope, _attempt) = partition.begin_segment_upload().unwrap();
     assert_eq!(again, first);
 }
 
@@ -500,13 +545,13 @@ async fn given_an_upload_that_fails_when_it_finishes_should_offer_the_segment_ag
 async fn given_a_cancelled_upload_when_its_result_arrives_should_not_advance() {
     let (_directory, mut partition) =
         Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
-    let (first, scope) = partition.begin_segment_upload().unwrap();
+    let (first, scope, attempt) = partition.begin_segment_upload().unwrap();
 
     partition.cancel_segment_upload();
 
     assert!(scope.is_cancelled());
     assert_eq!(
-        partition.finish_segment_upload(&first.record, &Ok(Ok(()))),
+        partition.finish_segment_upload(attempt, &first.record, &Ok(Ok(()))),
         None
     );
     assert_eq!(local_starts(&partition), [0, 2]);
@@ -520,7 +565,7 @@ async fn given_a_cancelled_upload_when_its_result_arrives_should_not_advance() {
 async fn given_a_replica_that_lost_primacy_when_scanned_should_cancel_its_upload_and_start_none() {
     let (_directory, mut partition) =
         Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
-    let (first, scope) = partition.begin_segment_upload().unwrap();
+    let (first, scope, attempt) = partition.begin_segment_upload().unwrap();
 
     // The next view's primary is another replica.
     let view = partition.consensus.view() + 1;
@@ -533,7 +578,7 @@ async fn given_a_replica_that_lost_primacy_when_scanned_should_cancel_its_upload
         "the scan stops the demoted replica's job"
     );
     assert_eq!(
-        partition.finish_segment_upload(&first.record, &Ok(Ok(()))),
+        partition.finish_segment_upload(attempt, &first.record, &Ok(Ok(()))),
         None
     );
     assert_eq!(local_starts(&partition), [0, 2]);
@@ -543,16 +588,120 @@ async fn given_a_replica_that_lost_primacy_when_scanned_should_cancel_its_upload
 async fn given_an_upload_that_ends_after_primacy_moved_when_it_finishes_should_not_advance() {
     let (_directory, mut partition) =
         Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
-    let (first, _scope) = partition.begin_segment_upload().unwrap();
+    let (first, _scope, attempt) = partition.begin_segment_upload().unwrap();
     let view = partition.consensus.view() + 1;
     partition.consensus.set_view(view);
 
     // No scan ran in between, so the result is still the awaited one.
     assert_eq!(
-        partition.finish_segment_upload(&first.record, &Ok(Ok(()))),
+        partition.finish_segment_upload(attempt, &first.record, &Ok(Ok(()))),
         None
     );
     assert_eq!(local_starts(&partition), [0, 2]);
+}
+
+fn regain_primacy(partition: &mut IggyPartition<IggyMessageBus>) {
+    while !partition.consensus.is_primary() {
+        let view = partition.consensus.view() + 1;
+        partition.consensus.set_view(view);
+    }
+}
+
+/// The segment of a cancelled upload is started again, so its first offset
+/// names both attempts.
+#[compio::test]
+async fn given_a_replaced_upload_when_the_cancelled_one_finishes_should_leave_the_replacement_in_flight()
+ {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let (first, cancelled_scope, cancelled) = partition.begin_segment_upload().unwrap();
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+    assert!(partition.begin_segment_upload().is_none());
+    regain_primacy(&mut partition);
+    let (again, scope, replacement) = partition.begin_segment_upload().unwrap();
+    assert_eq!(again, first);
+    assert_ne!(replacement, cancelled);
+    assert!(cancelled_scope.is_cancelled());
+
+    for late in [Err(TierJobCancelled), Ok(Ok(()))] {
+        assert_eq!(
+            partition.finish_segment_upload(cancelled, &first.record, &late),
+            None
+        );
+        assert_eq!(partition.segment_upload_attempt(), Some(replacement));
+        assert!(!scope.is_cancelled(), "the replacement still runs");
+        assert_eq!(local_starts(&partition), [0, 2]);
+    }
+
+    let advance = partition
+        .finish_segment_upload(replacement, &again.record, &Ok(Ok(())))
+        .unwrap();
+    assert_eq!((advance.start, advance.up_to), (0, 1));
+}
+
+/// Advances that do not commit leave the stored segments above the floor,
+/// where every search for the next upload would walk them again.
+#[compio::test]
+async fn given_stored_segments_above_a_floor_that_trails_when_asking_for_the_next_should_start_after_them()
+ {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let first = partition.next_segment_upload().unwrap();
+
+    partition.note_segment_uploaded(&first.record);
+
+    assert_eq!(partition.tiered_floor(), None);
+    assert_eq!(partition.upload_cursor, Some(first.record.end_offset + 1));
+    assert_eq!(partition.slot_after_uploaded(), 1);
+    let second = partition.next_segment_upload().unwrap();
+    assert_eq!(second.record.start_offset, 2);
+    partition.note_segment_uploaded(&second.record);
+    assert_eq!(partition.slot_after_uploaded(), 2);
+    assert_eq!(partition.next_segment_upload(), None);
+}
+
+/// A segment list rebuilt from disk marks every segment local.
+#[compio::test]
+async fn given_a_stored_segment_that_is_local_again_when_asking_for_the_next_should_offer_it() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let first = partition.next_segment_upload().unwrap();
+    partition.note_segment_uploaded(&first.record);
+    assert_eq!(
+        partition.next_segment_upload().unwrap().record.start_offset,
+        2
+    );
+
+    partition.log.segments_mut()[0].location = SegmentLocation::Local;
+
+    assert_eq!(partition.next_segment_upload(), Some(first));
+}
+
+#[compio::test]
+async fn given_a_segment_stored_out_of_turn_when_asking_for_the_next_should_offer_the_older_one() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let first = partition.next_segment_upload().unwrap();
+    let later = partition.sealed_segment_record(2).unwrap();
+
+    partition.note_segment_uploaded(&later);
+
+    assert_eq!(partition.next_segment_upload(), Some(first));
+}
+
+#[compio::test]
+async fn given_a_replica_that_lost_primacy_when_it_leads_again_should_search_from_the_floor() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let first = partition.next_segment_upload().unwrap();
+    partition.note_segment_uploaded(&first.record);
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+
+    assert!(partition.begin_segment_upload().is_none());
+
+    assert_eq!(partition.upload_cursor, None);
 }
 
 #[compio::test]
@@ -669,7 +818,7 @@ impl iggy_object_store::TierExecutor for Recording {
 async fn given_an_upload_when_submitted_should_name_the_upload_class_and_the_segment_size() {
     let (_directory, mut partition) =
         Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
-    let (first, scope) = partition.begin_segment_upload().unwrap();
+    let (first, scope, _attempt) = partition.begin_segment_upload().unwrap();
     let size = first.record.size;
     let uploader = crate::ExecutorUploader::new(
         Recording {
@@ -703,7 +852,7 @@ async fn given_an_admission_that_refuses_when_beginning_an_upload_should_start_n
 
     assert!(refused.is_none());
     assert_eq!(asked.get(), Some(size));
-    let (first, _scope) = partition
+    let (first, _scope, _attempt) = partition
         .begin_segment_upload()
         .expect("a refusal leaves no upload in flight");
     assert_eq!(first.record.start_offset, 0);
