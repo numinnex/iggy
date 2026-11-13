@@ -790,7 +790,7 @@ pub enum TieringJob {
     /// Record the front that retention had left before tiering was enabled,
     /// or a floor advance the replica applied.
     Append(ChainAppend),
-    /// Hash the next [`HASH_STEP_LEN`] bytes of a sealed segment that has no
+    /// Hash the next `HASH_STEP_LEN` bytes of a sealed segment that has no
     /// record from its `.log`, and record the segment once `digest` holds all
     /// of it. `append` holds the record with a zero hash.
     Hash {
