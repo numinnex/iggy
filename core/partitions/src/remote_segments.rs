@@ -24,7 +24,7 @@
 //!
 //! No partition is handed a store yet, so nothing in production reads one.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -36,9 +36,11 @@ use iggy_object_store::{
 };
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
+use server_common::poll::PollHistoryId;
 use tracing::{error, warn};
 
 use crate::iggy_index::IGGY_INDEX_SIZE;
+use crate::io::PartitionIoQuiescence;
 use crate::poll_plan::DiskFault;
 use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
 
@@ -147,12 +149,16 @@ impl RemoteSegments {
     /// sit inside the segment and none may step back, so an index that would
     /// send a walk outside the segment's bytes is refused and nothing is
     /// written.
+    ///
+    /// Nothing is kept either once `fetch` no longer stands for the segment
+    /// the plan saw: the path then belongs to another segment or to nothing.
     pub(crate) async fn fetch_index(
         &self,
         log: &RemoteRange,
         start_offset: u64,
         partition_dir: &str,
         index_path: &str,
+        fetch: &IndexFetch<'_>,
     ) -> Result<(), DiskFault> {
         let key = self.layout.segment_key(&SegmentKey {
             object: SegmentObject::Index,
@@ -167,11 +173,21 @@ impl RemoteSegments {
             let _ = compio::fs::remove_file(&staging).await;
             return written;
         }
-        let renamed = async {
-            compio::fs::rename(&staging, index_path).await?;
-            fsync_dir(partition_dir).await
+        if !fetch.may_publish() {
+            let _ = compio::fs::remove_file(&staging).await;
+            return Err(DiskFault::Retryable);
         }
-        .await;
+        let renamed = compio::fs::rename(&staging, index_path).await;
+        if renamed.is_ok() && fetch.segment_retired() {
+            // Retention unlinked the segment's files while the rename was in
+            // flight, and may have looked for this one before it existed.
+            let _ = compio::fs::remove_file(index_path).await;
+            return Err(DiskFault::Retryable);
+        }
+        let renamed = match renamed {
+            Ok(()) => fsync_dir(partition_dir).await,
+            Err(error) => Err(error),
+        };
         renamed.map_err(|error| {
             warn!(
                 target: "iggy.partitions.diag",
@@ -305,20 +321,135 @@ fn local_fault(path: &str, error: &std::io::Error) -> DiskFault {
     DiskFault::Retryable
 }
 
-/// Marks a segment's index as being fetched, so a second poll of the segment
-/// does not fetch and write the same file under the first.
-pub struct IndexFetch<'a>(&'a Cell<bool>);
+/// The index fetches of one partition incarnation.
+///
+/// A fetch runs without the partition and ends by putting a file in its
+/// directory. While the fetch is suspended the directory can pass to another
+/// incarnation, the history can be replaced and the segment can retire, and
+/// each of them reuses or frees the path the fetch writes. So teardown waits
+/// for the fetches in flight, and a fetch starts and publishes only while its
+/// segment is still the one its plan saw.
+pub struct IndexFetches {
+    io: Rc<PartitionIoQuiescence>,
+    history: Cell<PollHistoryId>,
+    /// End offset of the newest segment that retention retired from
+    /// `history`.
+    retired_through: Cell<Option<u64>>,
+    /// Start offsets of the segments whose index is being fetched, so a
+    /// second poll of a segment does not write the same file under the first.
+    fetching: RefCell<Vec<u64>>,
+}
 
-impl<'a> IndexFetch<'a> {
-    /// `None` while another poll holds the fetch.
-    pub(crate) fn begin(flag: &'a Cell<bool>) -> Option<Self> {
-        (!flag.replace(true)).then(|| Self(flag))
+impl IndexFetches {
+    pub(crate) fn new(io: Rc<PartitionIoQuiescence>, history: PollHistoryId) -> Self {
+        Self {
+            io,
+            history: Cell::new(history),
+            retired_through: Cell::new(None),
+            fetching: RefCell::default(),
+        }
+    }
+
+    /// What a plan built now holds of the fetches.
+    pub(crate) fn fence(self: &Rc<Self>) -> IndexFetchFence {
+        IndexFetchFence {
+            fetches: Rc::clone(self),
+            history: self.history.get(),
+        }
+    }
+
+    /// The partition serves another history from here on, whose segments can
+    /// reuse the paths of the ones before it.
+    pub(crate) fn replace_history(&self, history: PollHistoryId) {
+        self.history.set(history);
+        self.retired_through.set(None);
+    }
+
+    /// Retention retired the segments that end at or below `end_offset`.
+    pub(crate) fn retire_through(&self, end_offset: u64) {
+        self.retired_through
+            .set(self.retired_through.get().max(Some(end_offset)));
+    }
+}
+
+/// The index fetches of a plan's partition, with the history the plan was
+/// built in.
+#[derive(Clone)]
+pub struct IndexFetchFence {
+    fetches: Rc<IndexFetches>,
+    history: PollHistoryId,
+}
+
+impl IndexFetchFence {
+    /// Start fetching the index of the segment at `start_offset`.
+    ///
+    /// `None` while another poll fetches it, and once the plan's partition is
+    /// retiring or no longer serves the segment.
+    pub(crate) fn begin(&self, start_offset: u64) -> Option<IndexFetch<'_>> {
+        let fetches = &*self.fetches;
+        if !self.serves(start_offset)
+            || fetches.fetching.borrow().contains(&start_offset)
+            || !fetches.io.begin_local_work()
+        {
+            return None;
+        }
+        fetches.fetching.borrow_mut().push(start_offset);
+        Some(IndexFetch {
+            fence: self,
+            start_offset,
+        })
+    }
+
+    fn serves(&self, start_offset: u64) -> bool {
+        !self.fetches.io.is_retiring() && !self.retired(start_offset)
+    }
+
+    /// The plan's history is gone, or retention took the segment from it.
+    fn retired(&self, start_offset: u64) -> bool {
+        self.fetches.history.get() != self.history
+            || self
+                .fetches
+                .retired_through
+                .get()
+                .is_some_and(|through| start_offset <= through)
+    }
+
+    /// A fence no partition holds, for a plan built by hand.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Rc::new(IndexFetches::new(Rc::default(), PollHistoryId::default())).fence()
+    }
+}
+
+/// One fetch of a segment's index, which its partition's teardown waits for.
+pub struct IndexFetch<'a> {
+    fence: &'a IndexFetchFence,
+    start_offset: u64,
+}
+
+impl IndexFetch<'_> {
+    /// Whether the fetched index may still take its place in the partition
+    /// directory.
+    fn may_publish(&self) -> bool {
+        self.fence.serves(self.start_offset)
+    }
+
+    /// Whether retention retired the segment from the history the plan saw.
+    /// A replaced history says nothing about who owns the path now.
+    fn segment_retired(&self) -> bool {
+        self.fence.fetches.history.get() == self.fence.history
+            && self.fence.retired(self.start_offset)
     }
 }
 
 impl Drop for IndexFetch<'_> {
     fn drop(&mut self) {
-        self.0.set(false);
+        let fetches = &self.fence.fetches;
+        fetches
+            .fetching
+            .borrow_mut()
+            .retain(|start_offset| *start_offset != self.start_offset);
+        fetches.io.settle_local_work();
     }
 }
 
@@ -397,8 +528,10 @@ mod tests {
             asked: RefCell::default(),
         });
         let remote = RemoteSegments::new(objects.clone(), KeyLayout::new("iggy").unwrap());
+        let fence = IndexFetchFence::detached();
+        let fetch = fence.begin(START_OFFSET).unwrap();
         let fetched = remote
-            .fetch_index(&log(), START_OFFSET, &partition_dir, &index_path)
+            .fetch_index(&log(), START_OFFSET, &partition_dir, &index_path, &fetch)
             .await;
         let left = std::fs::read_dir(directory.path()).unwrap().count();
         let written = std::fs::read(&index_path).ok();
@@ -424,6 +557,36 @@ mod tests {
 
         assert_eq!(fetched, Err(DiskFault::Retryable));
         assert_eq!(written, None);
+    }
+
+    #[compio::test]
+    async fn given_a_segment_retired_under_the_rename_when_fetching_should_remove_the_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let partition_dir = directory.path().to_string_lossy().into_owned();
+        let index_path = format!("{partition_dir}/{START_OFFSET:020}.index");
+        let objects = Rc::new(Scripted {
+            index: index(),
+            etags: RefCell::new(vec!["a"; 3]),
+            asked: RefCell::default(),
+        });
+        let remote = RemoteSegments::new(objects, KeyLayout::new("iggy").unwrap());
+        let fetches = Rc::new(IndexFetches::new(Rc::default(), PollHistoryId::default()));
+        let fence = fetches.fence();
+        let fetch = fence.begin(START_OFFSET).unwrap();
+        let log = log();
+        let mut fetching =
+            Box::pin(remote.fetch_index(&log, START_OFFSET, &partition_dir, &index_path, &fetch));
+
+        // The file is in place before the fetch learns that its rename ended,
+        // which is where retention can find nothing to unlink and move on.
+        while !std::fs::exists(&index_path).unwrap() {
+            assert!(futures::poll!(fetching.as_mut()).is_pending());
+            compio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        fetches.retire_through(START_OFFSET);
+
+        assert_eq!(fetching.await, Err(DiskFault::Retryable));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     fn entries(entries: &[[u64; 3]]) -> Vec<u8> {
@@ -452,11 +615,47 @@ mod tests {
 
     #[test]
     fn given_a_fetch_in_flight_when_a_second_begins_should_wait_until_the_first_ends() {
-        let flag = Cell::new(false);
-        let first = IndexFetch::begin(&flag).unwrap();
-        assert!(IndexFetch::begin(&flag).is_none());
-        assert!(IndexFetch::begin(&flag).is_none());
+        let fence = IndexFetchFence::detached();
+        let first = fence.begin(START_OFFSET).unwrap();
+        assert!(fence.begin(START_OFFSET).is_none());
+        assert!(fence.begin(START_OFFSET).is_none());
+        // Another segment's index is another file.
+        assert!(fence.begin(START_OFFSET + 1).is_some());
         drop(first);
-        assert!(IndexFetch::begin(&flag).is_some());
+        assert!(fence.begin(START_OFFSET).is_some());
+    }
+
+    #[test]
+    fn given_a_plan_whose_segment_is_gone_when_fetching_should_neither_begin_nor_publish() {
+        let io = Rc::<PartitionIoQuiescence>::default();
+        let history = PollHistoryId::default();
+        let fetches = Rc::new(IndexFetches::new(Rc::clone(&io), history));
+        let fence = fetches.fence();
+
+        let fetch = fence.begin(START_OFFSET).unwrap();
+        assert!(fetch.may_publish());
+        fetches.retire_through(START_OFFSET - 1);
+        assert!(fetch.may_publish() && !fetch.segment_retired());
+        fetches.retire_through(START_OFFSET);
+        assert!(!fetch.may_publish() && fetch.segment_retired());
+        drop(fetch);
+        assert!(fence.begin(START_OFFSET).is_none());
+        assert!(fence.begin(START_OFFSET + 1).is_some());
+
+        let fetch = fence.begin(START_OFFSET + 1).unwrap();
+        fetches.replace_history(PollHistoryId::default());
+        // The new history may hold another segment at the path, so the fetch
+        // must not unlink it either.
+        assert!(!fetch.may_publish() && !fetch.segment_retired());
+        drop(fetch);
+        assert!(fence.begin(START_OFFSET + 1).is_none());
+        assert!(fetches.fence().begin(START_OFFSET).is_some());
+
+        let fence = fetches.fence();
+        let fetch = fence.begin(START_OFFSET).unwrap();
+        io.retire();
+        assert!(!fetch.may_publish() && !fetch.segment_retired());
+        drop(fetch);
+        assert!(fence.begin(START_OFFSET).is_none());
     }
 }

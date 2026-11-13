@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::remote_segments::IndexFetchFence;
 
 /// Fail-closed disk read: an unreadable EARLIER segment must stop the walk
 /// (return `Faulted`) rather than skip forward and serve a LATER segment's
@@ -60,6 +61,7 @@ async fn read_disk_faults_closed_when_earlier_segment_unreadable() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
@@ -141,6 +143,7 @@ async fn read_disk_serves_a_batch_wider_than_the_sized_chunk() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         bytes_per_message: Some(1),
         widest_batch_bytes: 0,
@@ -233,6 +236,7 @@ async fn read_disk_faults_closed_when_earlier_segment_corrupt() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
@@ -316,6 +320,7 @@ async fn read_disk_faults_closed_on_batch_checksum_mismatch() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
@@ -360,6 +365,7 @@ fn file_less_plan(persisted: u64) -> DiskReadPlan {
         partition_dir: PartitionDirResolution::NoFiles,
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
@@ -425,6 +431,7 @@ async fn read_disk_faults_closed_when_partition_dir_unresolvable() {
         partition_dir: PartitionDirResolution::Unresolvable,
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
@@ -499,6 +506,7 @@ async fn read_disk_caches_and_reuses_sealed_segment_fd() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
@@ -538,6 +546,7 @@ async fn read_disk_caches_and_reuses_sealed_segment_fd() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
@@ -606,6 +615,7 @@ async fn read_disk_does_not_retain_fd_for_untracked_handle() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
@@ -698,6 +708,7 @@ async fn read_disk_reloads_sealed_index_to_skip_scan() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
@@ -805,6 +816,7 @@ async fn read_disk_resolves_oversized_index_without_materializing() {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
         remote: None,
         object_prefix: None,
+        index_fetches: IndexFetchFence::detached(),
         cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,

@@ -27,7 +27,7 @@ use crate::journal::{
     MessageLookup, SPARSE_CHUNK_PIN_DIVISOR, push_selected_batch_fragments, select_batch_slice,
     unpin_sparse_source,
 };
-use crate::remote_segments::{IndexFetch, RemoteRange, RemoteSegments};
+use crate::remote_segments::{IndexFetchFence, RemoteRange, RemoteSegments};
 use crate::{Fragment, PollFragments, PollingConsumer};
 use compio::io::AsyncReadAtExt;
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader, BatchRef};
@@ -119,9 +119,6 @@ pub struct SealedSegmentReadState {
     /// others.
     /// Timestamp polls bypass it.
     pub(crate) offset_cursor: Cell<Option<SealedOffsetCursor>>,
-    /// Set while a poll fetches the `.index` object of a remote segment, so a
-    /// second poll does not write the same file under it.
-    pub(crate) index_fetching: Cell<bool>,
 }
 
 /// See [`SealedSegmentReadState::offset_cursor`].
@@ -152,6 +149,9 @@ pub struct DiskReadPlan {
     /// The prefix the partition's chain records, which names the object of a
     /// segment that left the disk after the plan was built.
     pub(crate) object_prefix: Option<ObjectPrefix>,
+    /// Gates the fetch of a remote segment's `.index` object on the partition
+    /// and the history the plan was built in.
+    pub(crate) index_fetches: IndexFetchFence,
     /// Segments to walk, snapshotted from the poll's starting segment onward
     /// (see `build_poll_plan`); `start_position` is the byte offset into the
     /// first one.
@@ -1408,10 +1408,12 @@ impl DiskReadPlan {
         let remote = self.remote.as_deref().ok_or(DiskFault::Retryable)?;
         // A second poll of the segment waits for the first one's fetch through
         // its client's retry.
-        let _fetch =
-            IndexFetch::begin(&segment.read_state.index_fetching).ok_or(DiskFault::Retryable)?;
+        let fetch = self
+            .index_fetches
+            .begin(segment.start_offset)
+            .ok_or(DiskFault::Retryable)?;
         remote
-            .fetch_index(log, segment.start_offset, partition_dir, path)
+            .fetch_index(log, segment.start_offset, partition_dir, path, &fetch)
             .await?;
         self.open_local_index(path)
             .await
@@ -1796,6 +1798,7 @@ mod tests {
             partition_dir: PartitionDirResolution::NoFiles,
             remote: None,
             object_prefix: None,
+            index_fetches: IndexFetchFence::detached(),
             cut: false,
             bytes_per_message,
             widest_batch_bytes,
@@ -1889,6 +1892,7 @@ mod tests {
             partition_dir: PartitionDirResolution::NoFiles,
             remote: None,
             object_prefix: None,
+            index_fetches: IndexFetchFence::detached(),
             cut: false,
             bytes_per_message: None,
             widest_batch_bytes: 0,
@@ -2064,6 +2068,7 @@ mod tests {
             partition_dir: PartitionDirResolution::Resolved(dir.display().to_string()),
             remote: None,
             object_prefix: None,
+            index_fetches: IndexFetchFence::detached(),
             cut: false,
             bytes_per_message: None,
             widest_batch_bytes: 0,
@@ -2207,6 +2212,7 @@ mod tests {
                         ),
                         remote: None,
                         object_prefix: None,
+                        index_fetches: IndexFetchFence::detached(),
                         cut: false,
                         bytes_per_message: None,
                         widest_batch_bytes: 0,
@@ -2339,6 +2345,7 @@ mod tests {
                     ),
                     remote: None,
                     object_prefix: None,
+                    index_fetches: IndexFetchFence::detached(),
                     cut: false,
                     bytes_per_message: None,
                     widest_batch_bytes: 0,
@@ -2562,6 +2569,7 @@ mod tests {
                     ),
                     remote: None,
                     object_prefix: None,
+                    index_fetches: IndexFetchFence::detached(),
                     cut: false,
                     bytes_per_message: None,
                     widest_batch_bytes: 0,

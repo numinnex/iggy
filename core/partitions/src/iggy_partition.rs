@@ -32,7 +32,7 @@ use crate::poll_plan::{
     PollTier, ResidentTailSnapshot, SegmentSource,
 };
 use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
-use crate::remote_segments::RemoteRange;
+use crate::remote_segments::{IndexFetches, RemoteRange};
 use crate::segment::{Segment, SegmentLocation};
 use crate::state_machine::StateMachines;
 use crate::state_transfer::{
@@ -182,6 +182,8 @@ where
     pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
     /// Where polls read segments whose `.log` left the disk.
     remote_segments: Option<Rc<crate::RemoteSegments>>,
+    /// The fetches of remote segments' indexes that polls have in flight.
+    index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
@@ -921,6 +923,8 @@ where
     pub fn new(stats: Arc<PartitionStats>, consensus: VsrConsensus<B>) -> Self {
         let observed_view = consensus.view();
         let single_replica = consensus.replica_count() == 1;
+        let io_active = Rc::<crate::io::PartitionIoQuiescence>::default();
+        let poll_history = PollHistoryId::default();
         let partition = Self {
             consensus,
             dedup: ClientTable::with_mode(
@@ -944,6 +948,7 @@ where
             state_machines: StateMachines::default(),
             segment_chain: None,
             remote_segments: None,
+            index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
             committed_bytes: 0,
@@ -988,10 +993,10 @@ where
             io_notifier: RefCell::new(None),
             io_bytes_max: Cell::new(isize::MAX as usize),
             io_sequence: Cell::new(0),
-            io_active: Rc::default(),
+            io_active,
             transition: None,
             deferred_views: Vec::new(),
-            poll_history: PollHistoryId::default(),
+            poll_history,
             incarnation: crate::PartitionIncarnation::default(),
             workerless_offset_files: Rc::default(),
             poll_notifier: None,
@@ -4541,6 +4546,7 @@ where
     pub(crate) fn invalidate_poll_history(&mut self) {
         self.workerless_offset_files.clear();
         self.poll_history = PollHistoryId::default();
+        self.index_fetches.replace_history(self.poll_history);
         self.publish_poll_visibility();
         self.discard_queued_auto_commits();
         self.transfer_plan.borrow_mut().take();
@@ -6045,6 +6051,7 @@ where
             partition_dir: self.partition_dir_resolution(),
             remote: self.remote_segments.clone(),
             object_prefix,
+            index_fetches: self.index_fetches.fence(),
             segments,
             cut,
             start_position,
@@ -12866,6 +12873,14 @@ where
             .inner
             .forget_segment(segment.start_offset);
         let (messages, indexes) = storage.segment_and_index_paths();
+        // A segment that came here remote has no `.index` in its storage, and
+        // a poll may have fetched one since or be fetching it now.
+        self.index_fetches.retire_through(segment.end_offset);
+        let indexes = indexes.or_else(|| {
+            let dir = self.partition_dir.as_deref()?;
+            (segment.location == SegmentLocation::Remote)
+                .then(|| format!("{dir}/{:0>20}.index", segment.start_offset))
+        });
         let anchor = self.anchor_cleanup_path(segment.start_offset);
         self.segment_checksum_cache
             .borrow_mut()
