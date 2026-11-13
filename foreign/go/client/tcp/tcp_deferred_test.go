@@ -253,10 +253,12 @@ func TestPollMessages_CancelOfAnImmediatePollSendsNoCancellation(t *testing.T) {
 }
 
 // The object store refused the read for good, so the poll is sent once and
-// its refusal reaches the caller.
+// its refusal reaches the caller. A refused read returns no messages, so a
+// committing poll stored nothing and its refusal is not an unknown outcome.
 func TestPollMessages_ReturnsATieredReadFailureWithoutSendingThePollAgain(t *testing.T) {
-	for _, deferred := range []bool{false, true} {
-		t.Run(fmt.Sprintf("deferred_%t", deferred), func(t *testing.T) {
+	for _, mode := range []struct{ deferred, autoCommit bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		deferred, autoCommit := mode.deferred, mode.autoCommit
+		t.Run(fmt.Sprintf("deferred_%t_auto_commit_%t", deferred, autoCommit), func(t *testing.T) {
 			client, serverConn := newPipeClient(t)
 			server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 				return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.TieredReadFailedCode), nil)
@@ -268,10 +270,10 @@ func TestPollMessages_ReturnsATieredReadFailureWithoutSendingThePollAgain(t *tes
 			if deferred {
 				code = command.PollMessagesDeferredCode
 				_, err = client.pollMessagesDeferred(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
-					consumer, iggcon.NextPollingStrategy(), 1, false, &partition, deferredOptions(2*time.Second, 5*time.Second))
+					consumer, iggcon.NextPollingStrategy(), 1, autoCommit, &partition, deferredOptions(2*time.Second, 5*time.Second))
 			} else {
 				_, err = client.pollMessages(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
-					consumer, iggcon.NextPollingStrategy(), 1, false, &partition)
+					consumer, iggcon.NextPollingStrategy(), 1, autoCommit, &partition)
 			}
 
 			require.ErrorIs(t, err, ierror.ErrTieredReadFailed)

@@ -380,6 +380,12 @@ struct ResourceOptionsTests {
         #expect(throws: IggyError(.optionNotUpdatable)) { try TopicUpdateOptions(reset: [.tieredStorage]).toPatch() }
         #expect(throws: IggyError(.optionNotUpdatable)) { try TopicUpdateOptions(tieredStorage: false).toPatch() }
         #expect(try TopicUpdateOptions(tieredStorage: true).toPatch().set[TopicOptionKey.tieredStorage.rawValue] == .explicit(.bool(true)))
+        // With a raw key or raw reset name the server decides, so `false` is sent and not refused here.
+        let rawSet = try TopicUpdateOptions(tieredStorage: false, raw: ["future_retention": "7days"]).toPatch()
+        #expect(rawSet.set[TopicOptionKey.tieredStorage.rawValue] == .explicit(.bool(false)))
+        let rawReset = try TopicUpdateOptions(tieredStorage: false, rawReset: ["future_retention"]).toPatch()
+        #expect(rawReset.set[TopicOptionKey.tieredStorage.rawValue] == .explicit(.bool(false)))
+        #expect(rawReset.reset == ["future_retention"])
     }
 
     /// The primary commits an `UpdateResource` under its scope's resolved

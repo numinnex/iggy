@@ -22,14 +22,19 @@ use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::poll_plan::{PollPlan, PollReadResult, PollTier};
 use crate::{RemoteObjects, RemoteSegments, SegmentLocation};
 use futures::FutureExt;
+use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
+use iggy_binary_protocol::batch::BatchHeader;
 use iggy_common::{IggyTimestamp, PollingStrategy};
 use iggy_object_store::{
     KeyLayout, MemoryStore, ObjectRange, ObjectStore, ObjectStoreError, PutBody, PutOptions,
     SegmentKey, SegmentObject,
 };
+use server_common::SegmentStorage;
 use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::ops::Range;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 /// Sealed segments of a partition with [`RECEIVER_OPS`] one-message ops.
@@ -668,6 +673,7 @@ async fn given_a_running_index_fetch_when_the_read_state_is_wiped_should_cancel_
     assert_eq!(outage.gets.get(), 1);
 
     // An install or a converge recreates the segment files.
+    partition.invalidate_poll_history();
     partition.log.invalidate_sealed_read_state();
 
     compio::time::sleep(SLOW_INDEX * 2).await;
@@ -748,4 +754,274 @@ async fn given_a_poll_that_later_segments_cover_when_planning_should_stop_the_sn
     let (last, bytes) = accepted(&mut partition, result);
     assert_eq!(last, Some(3));
     assert!(local[0].1.starts_with(&bytes));
+}
+
+/// The header of the batch at `position` of segment 0's object.
+async fn stored_batch(store: &MemoryStore, position: u64) -> BatchHeader {
+    let log = ObjectStore::get_range(store, &object_key(0, SegmentObject::Log), 0..u64::MAX)
+        .await
+        .unwrap()
+        .bytes;
+    BatchHeader::decode(&log[usize::try_from(position).unwrap()..]).unwrap()
+}
+
+#[compio::test]
+async fn given_an_index_entry_that_names_a_later_batch_when_polling_should_refuse_it() {
+    let (directory, mut partition, store, _local) = Box::pin(uploaded_partition()).await;
+    attach(&mut partition, store.clone());
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+    let first = stored_batch(&store, 0).await;
+    let second_position = first.total_size() as u64;
+    let second = stored_batch(&store, second_position).await;
+    assert_eq!((first.base_offset, second.base_offset), (0, 1));
+
+    // Each entry stays inside the segment and none steps back, which is all
+    // a fetch can check, and each one starts the walk at the second batch for
+    // a poll that the first batch answers.
+    let wrong_offset = [first.base_offset, first.base_timestamp, second_position];
+    let wrong_timestamp = [second.base_offset, 0, second_position];
+    let polls = [
+        (wrong_offset, PollingStrategy::offset(0)),
+        (
+            wrong_timestamp,
+            PollingStrategy::timestamp(IggyTimestamp::from(0)),
+        ),
+    ];
+    for (entry, strategy) in polls {
+        std::fs::remove_file(index_path(directory.path(), 0)).unwrap();
+        partition.log.invalidate_sealed_read_state();
+        let index = entry.into_iter().flat_map(u64::to_le_bytes).collect();
+        put(&store, &object_key(0, SegmentObject::Index), index).await;
+
+        // The second poll resolves the entry from the index the first kept.
+        for _ in 0..2 {
+            assert_eq!(
+                Box::pin(failed(&mut partition, strategy)).await,
+                IggyError::CannotReadMessage
+            );
+        }
+    }
+}
+
+/// A store whose first read of segment 0's `.index` object waits for
+/// `release`.
+struct Gated {
+    store: Rc<MemoryStore>,
+    gate: RefCell<Option<oneshot::Receiver<()>>>,
+    waiting: Cell<bool>,
+}
+
+impl RemoteObjects for Gated {
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+    ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+        async move {
+            let gate = self
+                .gate
+                .borrow_mut()
+                .take_if(|_| key == object_key(0, SegmentObject::Index));
+            if let Some(gate) = gate {
+                self.waiting.set(true);
+                gate.await.unwrap();
+            }
+            ObjectStore::get_range(&*self.store, key, range).await
+        }
+        .boxed_local()
+    }
+}
+
+type InFlight = Pin<Box<dyn Future<Output = PollReadResult>>>;
+
+/// An evicted partition without the local index of segment 0, and a poll of
+/// offset 0 that waits for the store to answer its index fetch.
+async fn fetching_partition() -> (
+    tempfile::TempDir,
+    IggyPartition<IggyMessageBus>,
+    InFlight,
+    oneshot::Sender<()>,
+) {
+    let (directory, mut partition, store, _local) = Box::pin(uploaded_partition()).await;
+    let (release, gate) = oneshot::channel();
+    let gated = Rc::new(Gated {
+        store,
+        gate: RefCell::new(Some(gate)),
+        waiting: Cell::new(false),
+    });
+    attach(&mut partition, gated.clone());
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+    std::fs::remove_file(index_path(directory.path(), 0)).unwrap();
+    let mut poll: InFlight = Box::pin(plan(&mut partition, PollingStrategy::offset(0)).execute());
+    while !gated.waiting.get() {
+        assert!(futures::poll!(poll.as_mut()).is_pending());
+        compio::time::sleep(Duration::from_millis(1)).await;
+    }
+    (directory, partition, poll, release)
+}
+
+/// What a later owner of the path keeps there.
+const SUCCESSOR_INDEX: &[u8] = b"the index of whatever owns the path now";
+
+/// Let the fetch finish, and check that it left the successor's file alone.
+async fn assert_fetch_does_not_publish(
+    directory: &Path,
+    poll: InFlight,
+    release: oneshot::Sender<()>,
+) {
+    std::fs::write(index_path(directory, 0), SUCCESSOR_INDEX).unwrap();
+    release.send(()).unwrap();
+    let result = poll.await;
+
+    assert_eq!(result.message_count, 0);
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+    assert_eq!(
+        std::fs::read(index_path(directory, 0)).unwrap(),
+        SUCCESSOR_INDEX
+    );
+}
+
+#[compio::test]
+async fn given_an_index_fetch_in_flight_when_the_partition_is_torn_down_should_wait_and_not_publish()
+ {
+    let (directory, partition, poll, release) = Box::pin(fetching_partition()).await;
+
+    let mut drain = Box::pin(partition.capture_teardown().drain());
+    for _ in 0..3 {
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        compio::time::sleep(Duration::from_millis(1)).await;
+    }
+    Box::pin(assert_fetch_does_not_publish(
+        directory.path(),
+        poll,
+        release,
+    ))
+    .await;
+    drain.await.unwrap();
+}
+
+/// The fetch outlives the polls that started it, so the teardown has to wait
+/// for the task itself.
+#[compio::test]
+async fn given_an_index_fetch_no_poll_waits_for_when_the_partition_is_torn_down_should_wait_for_it()
+{
+    let (directory, mut partition, outage, _local) = Box::pin(partition_with_a_slow_index()).await;
+    let result = polled_briefly(&mut partition).await;
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+    assert_eq!(outage.gets.get(), 1);
+
+    let mut drain = Box::pin(partition.capture_teardown().drain());
+    for _ in 0..3 {
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        compio::time::sleep(Duration::from_millis(1)).await;
+    }
+    drain.await.unwrap();
+
+    assert_eq!(outage.gets.get(), 1);
+    assert!(!index_path(directory.path(), 0).exists());
+}
+
+#[compio::test]
+async fn given_a_poll_waiting_for_an_index_fetch_when_the_history_is_replaced_should_end_at_once() {
+    let (directory, mut partition, poll, release) = Box::pin(fetching_partition()).await;
+
+    partition.invalidate_poll_history();
+
+    // The store has not answered, and the poll does not wait for it.
+    let result = compio::time::timeout(Duration::from_secs(5), poll)
+        .await
+        .expect("a cancelled fetch releases its waiters");
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+    assert!(
+        partition.log.sealed_read_state()[0]
+            .remote_failure
+            .get()
+            .is_none(),
+        "a cancelled fetch is no failure of the store"
+    );
+
+    // The task ends on its own once the store answers, and keeps nothing.
+    release.send(()).unwrap();
+    Box::pin(partition.capture_teardown().drain())
+        .await
+        .unwrap();
+    let index_name = format!("{:020}.index", 0);
+    let kept = std::fs::read_dir(directory.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(&index_name));
+    assert!(!kept);
+}
+
+#[compio::test]
+async fn given_a_plan_of_a_torn_down_partition_when_executing_should_not_fetch_the_index() {
+    let (directory, mut partition, store, _local) = Box::pin(uploaded_partition()).await;
+    attach(&mut partition, store);
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+    std::fs::remove_file(index_path(directory.path(), 0)).unwrap();
+    let planned = plan(&mut partition, PollingStrategy::offset(0));
+
+    Box::pin(partition.capture_teardown().drain())
+        .await
+        .unwrap();
+    let result = planned.execute().await;
+
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+    assert!(!index_path(directory.path(), 0).exists());
+}
+
+#[compio::test]
+async fn given_an_index_fetch_in_flight_when_the_history_is_replaced_should_not_publish() {
+    let (directory, mut partition, poll, release) = Box::pin(fetching_partition()).await;
+
+    partition.invalidate_poll_history();
+
+    Box::pin(assert_fetch_does_not_publish(
+        directory.path(),
+        poll,
+        release,
+    ))
+    .await;
+}
+
+#[compio::test]
+async fn given_an_index_fetch_in_flight_when_its_segment_retires_should_not_publish() {
+    let (directory, mut partition, poll, release) = Box::pin(fetching_partition()).await;
+    let first_end = partition.sealed_segment_record(0).unwrap().end_offset;
+
+    Box::pin(partition.remove_sealed_segments_up_to(first_end)).await;
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+    assert_eq!(partition.log.segments()[0].start_offset, first_end + 1);
+    release.send(()).unwrap();
+    let result = poll.await;
+
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+    let left: Vec<_> = std::fs::read_dir(directory.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&format!("{:020}.", 0)))
+        .collect();
+    assert_eq!(left, Vec::<String>::new());
+}
+
+#[compio::test]
+async fn given_a_fetched_index_when_its_segment_retires_should_remove_it() {
+    let (directory, mut partition, store, _local) = Box::pin(uploaded_partition()).await;
+    attach(&mut partition, store);
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+    // A segment that arrived remote, as a state transfer plants it: no index
+    // on disk and none in its storage.
+    std::fs::remove_file(index_path(directory.path(), 0)).unwrap();
+    partition.log.storages_mut()[0] = SegmentStorage::without_messages(None);
+    let (last, _) = Box::pin(polled(&mut partition, PollingStrategy::offset(0))).await;
+    assert_eq!(last, Some(RECEIVER_OPS - 1));
+    assert!(index_path(directory.path(), 0).exists());
+    let first_end = partition.sealed_segment_record(0).unwrap().end_offset;
+
+    Box::pin(partition.remove_sealed_segments_up_to(first_end)).await;
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+
+    assert_eq!(partition.log.segments()[0].start_offset, first_end + 1);
+    assert!(!index_path(directory.path(), 0).exists());
 }

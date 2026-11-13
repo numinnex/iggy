@@ -1672,6 +1672,36 @@ func TestPartitionReader_SendsAgainAnEmptyReadOfWhatALostReplyStored(t *testing.
 	assert.Equal(t, []uint64{2, 3, 4}, offsets(result.polled))
 }
 
+// A stop during the read again of what a lost reply stored leaves the
+// partition to a seek, which drops the range and the batch read after it, and
+// a seek to Next reads after both. So the stop reports the range as lost and
+// hands over that batch before its own error.
+func TestPartitionReader_ReportsTheLostRangeAndHandsOverTheHeldBatchBeforeAStopUnderOnRead(t *testing.T) {
+	client := newFakeClient()
+	reader := standalone(t, client, withCommit(waitOneSecond, iggcon.OnReadCommit()), 1)
+	polled := nextInBackground(reader)
+	client.nextRead(t).answer(section(1, 0, 1))
+	require.NoError(t, (<-polled).err)
+	polled = nextInBackground(reader)
+	client.nextRead(t).reply <- fakeReply{err: ierror.FetchProgressUncertain{OperationID: 42}}
+	client.nextRead(t).answer(section(1, 5, 6))
+	again := client.nextRead(t)
+	require.False(t, again.commit)
+	require.Equal(t, uint64(2), again.targets[0].Strategy.Value)
+
+	again.answer(iggcon.FetchMessagesSection{PartitionId: 1, Err: ierror.ErrTieredReadFailed})
+
+	err := (<-polled).err
+	require.ErrorIs(t, err, ierror.FetchProgressUncertain{})
+	var lost *ReadError
+	require.ErrorAs(t, err, &lost)
+	assert.Equal(t, &OffsetRange{First: 2, Last: 4}, lost.Lost)
+	assert.Equal(t, []uint64{5, 6}, offsets(next(t, reader)))
+	_, err = reader.Next(context.Background())
+	require.ErrorIs(t, err, ierror.ErrTieredReadFailed)
+	assert.True(t, client.readsNothingFor(300*time.Millisecond), "the stopped partition reads nothing until a seek")
+}
+
 // A read again of what a lost reply stored that the server serves from after
 // its start shows that the history no longer holds that start, as after
 // retention. The reader reports that part once, then hands over the messages
