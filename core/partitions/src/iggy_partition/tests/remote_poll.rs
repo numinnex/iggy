@@ -23,6 +23,7 @@ use crate::poll_plan::{PollPlan, PollReadResult, PollTier};
 use crate::{RemoteObjects, RemoteSegments, SegmentLocation};
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
+use iggy_binary_protocol::batch::BatchHeader;
 use iggy_common::{IggyTimestamp, PollingStrategy};
 use iggy_object_store::{
     KeyLayout, MemoryStore, ObjectRange, ObjectStore, ObjectStoreError, PutBody, PutOptions,
@@ -376,4 +377,51 @@ async fn given_a_poll_that_later_segments_cover_when_planning_should_stop_the_sn
     let (last, bytes) = accepted(&mut partition, result);
     assert_eq!(last, Some(3));
     assert!(local[0].1.starts_with(&bytes));
+}
+
+/// The header of the batch at `position` of segment 0's object.
+async fn stored_batch(store: &MemoryStore, position: u64) -> BatchHeader {
+    let log = ObjectStore::get_range(store, &object_key(0, SegmentObject::Log), 0..u64::MAX)
+        .await
+        .unwrap()
+        .bytes;
+    BatchHeader::decode(&log[usize::try_from(position).unwrap()..]).unwrap()
+}
+
+#[compio::test]
+async fn given_an_index_entry_that_names_a_later_batch_when_polling_should_refuse_it() {
+    let (directory, mut partition, store, _local) = Box::pin(uploaded_partition()).await;
+    attach(&mut partition, store.clone());
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+    let first = stored_batch(&store, 0).await;
+    let second_position = first.total_size() as u64;
+    let second = stored_batch(&store, second_position).await;
+    assert_eq!((first.base_offset, second.base_offset), (0, 1));
+
+    // Each entry stays inside the segment and none steps back, which is all
+    // a fetch can check, and each one starts the walk at the second batch for
+    // a poll that the first batch answers.
+    let wrong_offset = [first.base_offset, first.base_timestamp, second_position];
+    let wrong_timestamp = [second.base_offset, 0, second_position];
+    let polls = [
+        (wrong_offset, PollingStrategy::offset(0)),
+        (
+            wrong_timestamp,
+            PollingStrategy::timestamp(IggyTimestamp::from(0)),
+        ),
+    ];
+    for (entry, strategy) in polls {
+        std::fs::remove_file(index_path(directory.path(), 0)).unwrap();
+        partition.log.invalidate_sealed_read_state();
+        let index = entry.into_iter().flat_map(u64::to_le_bytes).collect();
+        put(&store, &object_key(0, SegmentObject::Index), index).await;
+
+        // The second poll resolves the entry from the index the first kept.
+        for _ in 0..2 {
+            assert_eq!(
+                Box::pin(failed(&mut partition, strategy)).await,
+                IggyError::CannotReadMessage
+            );
+        }
+    }
 }

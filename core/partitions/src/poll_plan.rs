@@ -21,7 +21,7 @@
 //! yield. Execution returns facts about that snapshot. Only the partition
 //! owner validates its history and accepts progress.
 
-use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndexCache};
+use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
 use crate::iggy_index_reader::IggyIndexReader;
 use crate::journal::{
     MessageLookup, SPARSE_CHUNK_PIN_DIVISOR, push_selected_batch_fragments, select_batch_slice,
@@ -134,6 +134,8 @@ pub struct SealedOffsetCursor {
     pub(crate) valid_until: u64,
     /// Start byte the whole interval resolves to.
     pub(crate) position: u64,
+    /// Timestamp of the resolved index entry.
+    pub(crate) timestamp: u64,
 }
 
 pub type SealedSegmentHandle = Rc<SealedSegmentReadState>;
@@ -734,6 +736,9 @@ struct DiskWalk {
     last_matching_offset: Option<u64>,
     /// Batch width learned from an incomplete read, capped at the chunk ceiling.
     batch_read_floor: u64,
+    /// The index entry the walk starts from, until the batch at its position
+    /// proves to be the one it names.
+    unproven_entry: Option<IggyIndex>,
     #[cfg(feature = "poll-diagnostics")]
     requested_bytes: u64,
     #[cfg(feature = "poll-diagnostics")]
@@ -770,6 +775,7 @@ impl DiskWalk {
             fragments: PollFragments::new(),
             last_matching_offset: None,
             batch_read_floor: 0,
+            unproven_entry: None,
             max_bytes: usize::MAX,
             max_selected_bytes: usize::MAX,
             selected_bytes: 0,
@@ -904,13 +910,13 @@ impl DiskReadPlan {
             }
             None => None,
         };
-        let position = resolved.map_or(self.start_position, |(position, _)| position);
+        let position = resolved.map_or(self.start_position, |entry| entry.position);
         // The index is sparse, so the entry it resolved can sit a whole flush
         // group before the requested offset. The walk has to read that run to
         // reach the first match, and sizing the read from the requested count
         // alone would cross it in floor-sized reads.
         let entry_offset = resolved
-            .map(|(_, offset)| offset)
+            .map(|entry| entry.offset)
             .or(self.start_index_offset);
         let skipped = match (entry_offset, query) {
             (Some(entry_offset), MessageLookup::Offset { offset, .. }) => {
@@ -919,6 +925,7 @@ impl DiskReadPlan {
             _ => 0,
         };
         let mut walk = DiskWalk::starting_at(position, skipped);
+        walk.unproven_entry = resolved.filter(|_| self.starts_remote());
         walk.max_bytes = max_bytes;
         walk.max_selected_bytes = max_selected_bytes;
         // Set when an open/read retry exhausts. The walk breaks immediately so
@@ -977,6 +984,22 @@ impl DiskReadPlan {
         );
 
         self.outcome(walk, fault, count)
+    }
+
+    /// Whether the walk starts in a remote segment.
+    ///
+    /// Such a segment is read on its index's word, and the most a fetch can
+    /// check of an index object is that it stays inside the segment. An entry
+    /// that names a later batch would start the walk past messages the poll
+    /// asked for, so the walk proves the entry it starts from.
+    fn starts_remote(&self) -> bool {
+        matches!(
+            self.segments.first(),
+            Some(DiskSegment {
+                source: SegmentSource::Remote(_),
+                ..
+            })
+        )
     }
 
     /// What a finished walk amounts to.
@@ -1046,6 +1069,19 @@ impl DiskReadPlan {
                 // Same fail-closed reason as a failed open.
                 Err(fault) => return SegmentWalk::Faulted(fault),
             };
+            if let Some(entry) = walk.unproven_entry.take()
+                && !entry_names_batch(&entry, &chunk)
+            {
+                error!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = self.namespace_raw,
+                    offset = entry.offset,
+                    position = entry.position,
+                    "remote poll: an index entry does not name the batch at its position"
+                );
+                return SegmentWalk::Faulted(DiskFault::Unreadable);
+            }
             let fragments_before_chunk = walk.fragments.len();
             let ChunkWalk {
                 consumed,
@@ -1267,7 +1303,7 @@ impl DiskReadPlan {
         query: MessageLookup,
         partition_dir: &str,
         max_bytes: usize,
-    ) -> Result<Option<(u64, u64)>, DiskFault> {
+    ) -> Result<Option<IggyIndex>, DiskFault> {
         // The active segment grows under the reader, so neither the shared
         // sparse index nor the offset memo can describe it; its own resident
         // index already resolved `start_position`.
@@ -1292,7 +1328,11 @@ impl DiskReadPlan {
             && offset >= cursor.offset
             && offset < cursor.valid_until
         {
-            return Ok(Some((cursor.position, cursor.offset)));
+            return Ok(Some(IggyIndex::new(
+                cursor.offset,
+                cursor.timestamp,
+                cursor.position,
+            )));
         }
         let path = format!("{partition_dir}/{:0>20}.index", segment.start_offset);
         let Some((reader, entry_count)) = self.open_index(segment, partition_dir, &path).await?
@@ -1327,6 +1367,7 @@ impl DiskReadPlan {
                             offset: entry.offset,
                             valid_until: successor_offset.unwrap_or(u64::MAX),
                             position: entry.position,
+                            timestamp: entry.timestamp,
                         }));
                         entry
                     })),
@@ -1338,7 +1379,7 @@ impl DiskReadPlan {
             }
         };
         match looked_up {
-            Ok(entry) => Ok(entry.map(|entry| (entry.position, entry.offset))),
+            Ok(entry) => Ok(entry),
             Err(error) => {
                 self.warn_sparse_index_fallback(&path, "lower_bound", &error);
                 index_fallback(segment)
@@ -1488,7 +1529,7 @@ impl DiskReadPlan {
 
 /// What a segment whose index cannot be read resolves to: the byte-0 scan for
 /// a local one, a retryable fault for a remote one.
-const fn index_fallback(segment: &DiskSegment) -> Result<Option<(u64, u64)>, DiskFault> {
+const fn index_fallback(segment: &DiskSegment) -> Result<Option<IggyIndex>, DiskFault> {
     match segment.source {
         SegmentSource::Local => Ok(None),
         SegmentSource::Remote(_) => Err(DiskFault::Retryable),
@@ -1499,15 +1540,23 @@ const fn index_fallback(segment: &DiskSegment) -> Result<Option<(u64, u64)>, Dis
 /// timestamp, or `None` when the query is below the first indexed entry (the
 /// caller then scans from the segment start). Mirrors `disk_poll_start`'s
 /// resident-index resolution for the sealed, off-pump path.
-/// Start byte for `query`, and the offset of the index entry it resolved to.
+/// The entry holds the start byte for `query` and the offset it resolved to.
 /// The entry sits at or before the requested offset, so the difference is the
 /// run the walk has to skip before it can match anything.
-fn resolve_index_position(index: &IggyIndexCache, query: MessageLookup) -> Option<(u64, u64)> {
+fn resolve_index_position(index: &IggyIndexCache, query: MessageLookup) -> Option<IggyIndex> {
     match query {
         MessageLookup::Offset { offset, .. } => index.offset_lower_bound(offset),
         MessageLookup::Timestamp { timestamp, .. } => index.timestamp_lower_bound(timestamp),
     }
-    .map(|entry| (entry.position, entry.offset))
+    .copied()
+}
+
+/// Whether the batch that starts `chunk`, read at the entry's position, is the
+/// one `entry` was written for.
+fn entry_names_batch(entry: &IggyIndex, chunk: &[u8]) -> bool {
+    BatchHeader::decode(chunk).is_ok_and(|header| {
+        header.base_offset == entry.offset && header.base_timestamp == entry.timestamp
+    })
 }
 
 /// Bytes of the allocations `fragments` keep alive that `charged` did not
@@ -1631,7 +1680,6 @@ struct ChunkWalk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iggy_index::IggyIndex;
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
     use server_common::iobuf::Owned;
@@ -2034,7 +2082,7 @@ mod tests {
             .await;
         // The entry offset rides along so the caller can size its first read
         // to cover the run between that entry and the requested offset.
-        assert_eq!(first, Ok(Some((200, 20))));
+        assert_eq!(first, Ok(Some(IggyIndex::new(20, 3, 200))));
         let cursor = handle.offset_cursor.get().expect("cursor memoized");
         assert_eq!(
             (cursor.offset, cursor.valid_until, cursor.position),
@@ -2047,7 +2095,7 @@ mod tests {
         let in_interval = plan
             .resolve_sealed_start(&segment, offset_query(29), &partition_dir, usize::MAX)
             .await;
-        assert_eq!(in_interval, Ok(Some((200, 20))));
+        assert_eq!(in_interval, Ok(Some(IggyIndex::new(20, 3, 200))));
 
         // ...while an offset past the interval misses the cursor, reaches for
         // the (now gone) file, and falls back to the byte-0 scan.
