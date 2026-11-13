@@ -453,6 +453,88 @@ async fn given_a_tiered_receiver_when_a_transfer_installs_should_drop_its_chain(
     assert!(!Path::new(&chain_path(&directory.path().to_string_lossy())).exists());
 }
 
+/// The backup copies the chain, which grows with the partition, through one
+/// buffer the plan has to reserve.
+#[compio::test]
+async fn given_a_tiered_receiver_when_an_install_backs_up_should_charge_the_copy_buffer() {
+    const STEPS_MAX: usize = 128;
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut partition) = Box::pin(tiered_partition_with_wal(root.path())).await;
+    set_offset_dirs_under(
+        &mut partition,
+        Path::new(&config.get_partition_path(1, 1, 0)),
+    );
+    let file_phase_charge = crate::io::file_phase_charge::<PingPongSuperblock>(
+        std::iter::once(partition.partition_dir.as_deref())
+            .chain(ConsumerKind::ALL.map(|kind| partition.consumer_offsets_dir(kind)))
+            .flatten(),
+    )
+    .unwrap();
+    let prepare = checksummed_segment_prepare(1, 0, 0, b"payload");
+    let body = prepare.as_slice()[size_of::<PrepareHeader>()..].to_vec();
+    let artifact = consensus::StateArtifact::for_bytes(
+        consensus::state_manifest::artifact_kind::SEGMENT_LOG,
+        0,
+        &body,
+    );
+    let staged = partition
+        .spill_transfer_segment(&artifact, body, None)
+        .await
+        .unwrap();
+    let wire = crate::state_transfer::ConsumerOffsetsWire {
+        producers: Vec::new(),
+        dedup_capacity: consensus::PARTITION_DEDUP_CLIENTS_MAX,
+        prepare_checksum: Some(prepare.header().checksum),
+        checkpoint_prepare: prepare.as_slice().to_vec(),
+        next_offset: 1,
+        ..Default::default()
+    };
+    partition
+        .queue_state_transfer_install(1, vec![staged], &wire.encode(), 1)
+        .unwrap();
+    let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+
+    let mut backups = 0;
+    for _ in 0..STEPS_MAX {
+        match partition.resume_io(&config).await {
+            crate::PartitionIoStep::Ready(plan) => {
+                let captured = partition.capture_io(plan, &config).unwrap().unwrap();
+                if matches!(
+                    captured.job,
+                    crate::PartitionIoJob::Transfer(crate::io::TransferFileJob::Backup {
+                        begin: true,
+                        ..
+                    })
+                ) {
+                    assert_eq!(
+                        plan.allocation_charge,
+                        file_phase_charge + crate::install_backup::COPY_BUFFER_BYTES
+                    );
+                    backups += 1;
+                }
+                let result = captured.job.execute().await;
+                partition.accept_io(captured.identity, result).unwrap();
+                if let Some(gate) = captured.gate {
+                    gate.release();
+                }
+            }
+            crate::PartitionIoStep::Progress => {}
+            crate::PartitionIoStep::Pending => {
+                persistence
+                    .drain_with_timeout(compio::runtime::time::sleep)
+                    .await
+                    .unwrap();
+            }
+            crate::PartitionIoStep::InstallFinished { outcome, .. } => {
+                outcome.unwrap();
+                break;
+            }
+            _ => panic!("unexpected install continuation"),
+        }
+    }
+    assert_eq!(backups, 1);
+}
+
 /// One-message records per segment of [`tiered_partition_with_wal`].
 const WAL_RECORDS_PER_SEGMENT: u64 = 2;
 
