@@ -149,6 +149,21 @@ public sealed class HttpCommittingPollTests
         Assert.Equal(1, server.Requests);
     }
 
+    /// <summary>A refused read returns no messages, so the server stored nothing and the partition stays open.</summary>
+    [Fact]
+    public async Task given_a_committing_poll_when_the_tiered_read_fails_should_report_it_without_a_block()
+    {
+        var server = new ScriptedHandler((HttpStatusCode.FailedDependency, TieredReadFailed), (HttpStatusCode.OK, Batch));
+        var client = Client(server);
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(client, true));
+        var polled = await PollAsync(client, true);
+
+        Assert.Equal((VsrError.TIERED_READ_FAILED, true), (error.StatusCode, error.FromServer));
+        Assert.Single(polled.Messages);
+        Assert.Equal(2, server.Requests);
+    }
+
     private static HttpMessageStream Client(HttpMessageHandler server)
     {
         return new HttpMessageStream(new HttpClient(new TransientHttpRetryHandler(server))

@@ -3621,15 +3621,8 @@ impl StateHandler for UpdateTopicResolvedRequest {
         // Only a build that knows the option admits its enable, and only once
         // every member of the cluster runs one, so every replica that applies
         // this takes the same branch and bumps the same revision.
-        let newly_tiered: Vec<(usize, u64)> = if !was_tiered && topic.resolved.tiered_storage {
-            topic
-                .partitions
-                .iter()
-                .map(|partition| (partition.id, partition.created_revision))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let newly_tiered =
+            !was_tiered && topic.resolved.tiered_storage && !topic.partitions.is_empty();
         // An equal patch commits as ok but changes nothing public.
         let after = stream
             .topics
@@ -3645,18 +3638,13 @@ impl StateHandler for UpdateTopicResolvedRequest {
             })
             .into_iter()
             .collect();
-        if !newly_tiered.is_empty() {
+        if newly_tiered {
             state.revision = state.revision.wrapping_add(1);
-            for (partition_id, created_revision) in newly_tiered {
-                state.recent_partition_changes.push(
-                    state.revision,
-                    PartitionChange {
-                        namespace: IggyNamespace::new(stream_id, topic_id, partition_id),
-                        created_revision,
-                        kind: PartitionChangeKind::TieringEnabled,
-                    },
-                );
-            }
+            state.record_topic_partition_changes(
+                stream_id,
+                topic_id,
+                PartitionChangeKind::TieringEnabled,
+            );
         }
         ApplyReply {
             changes,
@@ -6101,6 +6089,34 @@ mod tests {
         );
         assert_eq!(inner.revision, enabled);
         assert_eq!(changes_since(&inner, enabled), []);
+    }
+
+    #[test]
+    fn given_a_topic_without_partitions_when_tiered_storage_is_enabled_should_keep_the_revision() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        create_topic_with_partitions(&mut inner, 0);
+        let created = inner.revision;
+        let mut explicit = ResourceOptions::new();
+        explicit.insert(
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(true.encode().unwrap()),
+        );
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All).unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+
+        assert_eq!(
+            StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+
+        assert!(inner.items[0].topics[0].resolved.tiered_storage);
+        assert_eq!(inner.revision, created);
     }
 
     /// Readers act on every partition a commit touched, so each applied

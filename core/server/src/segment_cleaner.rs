@@ -124,11 +124,17 @@ pub fn stage_owned_partitions(
                 now,
                 local_envelope(age, size, partition_count),
             );
-            let committed_up_to = streams
-                .with_committed_partition(namespace, |partition| partition.deleted_up_to_offset)
-                .unwrap_or_default();
+            // One lookup, so both passes name the incarnation the watermark
+            // was read for.
+            let Some((created_revision, committed_up_to)) = streams
+                .with_committed_partition(namespace, |partition| {
+                    (partition.created_revision, partition.deleted_up_to_offset)
+                })
+            else {
+                continue;
+            };
             // Staged after the loop, where the shard orders them.
-            tiered.push((namespace, committed_up_to));
+            tiered.push((namespace, created_revision, committed_up_to));
             // Staged whatever the topic's policy is: a truncation a client
             // asked for leaves objects behind as well.
             shard.request_delete_objects(namespace, now, committed_up_to);
@@ -138,6 +144,7 @@ pub fn stage_owned_partitions(
             if has_expiry || budget.is_some() {
                 shard.request_retain_partition(
                     namespace,
+                    created_revision,
                     now,
                     message_expiry,
                     budget.map(|budget| budget.max_bytes),

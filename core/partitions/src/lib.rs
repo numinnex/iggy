@@ -57,7 +57,8 @@ pub use object_delete::{
 };
 pub use segment_chain::object_prefix;
 pub use segment_upload::{
-    ExecutorUploader, SegmentUpload, SegmentUploader, UploadError, UploadOutcome, upload_segment,
+    ExecutorUploader, SegmentUpload, SegmentUploadAttempt, SegmentUploader, StartedSegmentUpload,
+    UploadError, UploadOutcome, upload_segment,
 };
 mod segment_recovery;
 pub mod state_machine;

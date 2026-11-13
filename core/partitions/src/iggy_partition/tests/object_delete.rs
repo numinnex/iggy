@@ -967,7 +967,7 @@ async fn given_an_upload_that_lands_after_its_segment_was_removed_when_it_finish
     let (_directory, mut partition) =
         Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
     let deleter = deleter();
-    let (upload, _scope) = partition.begin_segment_upload().unwrap();
+    let (upload, _scope, attempt) = partition.begin_segment_upload().unwrap();
     assert_eq!(upload.record.start_offset, SEALED[0].0);
     upload_segment(store(&deleter), &layout(), &upload)
         .await
@@ -982,7 +982,7 @@ async fn given_an_upload_that_lands_after_its_segment_was_removed_when_it_finish
     let landed = IggyTimestamp::now();
 
     assert_eq!(
-        partition.finish_segment_upload(&upload.record, &Ok(Ok(()))),
+        partition.finish_segment_upload(attempt, &upload.record, &Ok(Ok(()))),
         None,
         "no advance over a segment that is gone"
     );
@@ -1011,7 +1011,7 @@ async fn given_an_upload_that_lands_after_its_segment_was_removed_when_it_finish
     // brings the watermark of that truncation.
     assert!(partition.begin_segment_upload().is_none());
     partition.note_committed_truncation(committed);
-    let (next, _scope) = partition.begin_segment_upload().unwrap();
+    let (next, _scope, _attempt) = partition.begin_segment_upload().unwrap();
     assert_eq!(next.record.start_offset, SEALED[1].0);
 }
 
