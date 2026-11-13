@@ -101,7 +101,7 @@ fn encode_free_space(
     let gauges = [
         (
             "data_disk_free_bytes",
-            "estimated free space on the disk of the data directory in bytes: the last sample minus what Iggy wrote since",
+            "estimated free space on the disk of the data directory in bytes: the last sample minus what Iggy wrote since and what it accepted and has not written yet",
             reserve.free_bytes(),
         ),
         (
@@ -471,7 +471,8 @@ mod tests {
         reserve.observe(2 * MIB, 100 * MIB);
         // Written since the sample, so the scrape shows it before the next one.
         drop(USAGE.charge(MIB + 1));
-        assert!(reserve.refuses_messages());
+        assert!(!reserve.admit(0));
+        reserve.count_refusal();
         let mut registry = Registry::default();
         registry.register_collector(Box::new(SampledFreeSpace(Arc::clone(&reserve))));
 
