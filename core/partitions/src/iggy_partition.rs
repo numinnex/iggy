@@ -7519,10 +7519,7 @@ where
         let segments = self.log.segments();
         match query {
             MessageLookup::Offset { offset, .. } => {
-                let segment_index = segments
-                    .iter()
-                    .rposition(|segment| segment.start_offset <= *offset)
-                    .unwrap_or(0);
+                let segment_index = segment_holding(segments, *offset);
                 let entry = self
                     .log
                     .segment_indexes(segment_index)
@@ -14722,6 +14719,17 @@ fn walked_segments(segments: &[Segment], count: u32, byte_budget: usize) -> usiz
             return walked;
         }
         let size = segment.size.as_bytes_u64();
+/// Index of the last of `segments` that starts at or below `offset`, or of the
+/// first one when they all start above it.
+///
+/// Segments are ordered by start offset, and remote ones make the list as
+/// long as total retention, so the lookup must not cost a step per segment.
+fn segment_holding(segments: &[Segment], offset: u64) -> usize {
+    segments
+        .partition_point(|segment| segment.start_offset <= offset)
+        .saturating_sub(1)
+}
+
         if size > 0 {
             messages = messages
                 .saturating_add(segment.end_offset.saturating_sub(segment.start_offset) + 1);

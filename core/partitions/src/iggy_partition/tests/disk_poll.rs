@@ -838,3 +838,16 @@ async fn read_disk_resolves_oversized_index_without_materializing() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn given_ordered_segments_when_locating_an_offset_should_pick_the_last_that_starts_at_or_below_it()
+{
+    let segments =
+        [10, 20, 30].map(|start_offset| Segment::new(start_offset, IggyByteSize::default()));
+
+    let located =
+        [0, 10, 19, 20, 29, 30, u64::MAX].map(|offset| segment_holding(&segments, offset));
+
+    assert_eq!(located, [0, 0, 0, 1, 1, 2, 2]);
+    assert_eq!(segment_holding(&[], 7), 0);
+}
