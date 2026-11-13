@@ -831,7 +831,7 @@ impl SegmentChain {
         let digest = active
             .filter(|active| active.size.as_bytes_u64() == 0)
             .map(|active| Box::new(SegmentDigest::new(active.start_offset)));
-        let advances = chain
+        let advances: BTreeMap<_, _> = chain
             .records
             .iter()
             .filter_map(|record| match record {
@@ -846,49 +846,76 @@ impl SegmentChain {
             sealed,
             remote,
             confirmed: BTreeSet::new(),
-            advances,
+            advances: BTreeMap::new(),
             diverged: BTreeSet::new(),
             trim_point: chain.trim_point(),
             digest,
         };
-        loaded.settle_advances();
+        for (up_to, hash) in advances {
+            loaded.take_advance(up_to, hash, &mut Vec::new());
+        }
         loaded
     }
 
-    /// Compare every unsettled advance with this replica's own sealed record.
-    /// A match confirms the segment, which may then leave the disk. Returns
-    /// the advances found to contradict it by this call.
-    fn settle_advances(&mut self) -> Vec<u64> {
-        let mut diverged = Vec::new();
-        let trim_point = self.trim_point;
-        let (sealed, confirmed) = (&self.sealed, &mut self.confirmed);
-        self.advances.retain(|up_to, hash| {
-            if trim_point.is_some_and(|trim_point| *up_to <= trim_point) {
-                return false;
-            }
-            // The one sealed record that holds the offset, if this replica
-            // sealed it already.
-            let Some((start_offset, record)) = sealed
-                .range(..=*up_to)
-                .next_back()
-                .filter(|(_, record)| record.end_offset >= *up_to)
-            else {
-                return true;
-            };
-            if record.end_offset == *up_to && record.hash == *hash {
-                confirmed.insert(*start_offset);
-            } else {
-                diverged.push(*up_to);
-            }
-            false
-        });
-        self.diverged.extend(&diverged);
-        diverged
+    /// Compare the advance ending at `up_to` with this replica's own sealed
+    /// record of the segment that holds the offset. A match confirms the
+    /// segment, which may then leave the disk, and anything else is pushed to
+    /// `diverged`. Returns `false` while that segment has not sealed here.
+    fn settle_advance(
+        &mut self,
+        up_to: u64,
+        hash: &[u8; SEGMENT_HASH_SIZE],
+        diverged: &mut Vec<u64>,
+    ) -> bool {
+        if self
+            .trim_point
+            .is_some_and(|trim_point| up_to <= trim_point)
+        {
+            return true;
+        }
+        let Some((start_offset, record)) = self
+            .sealed
+            .range(..=up_to)
+            .next_back()
+            .filter(|(_, record)| record.end_offset >= up_to)
+        else {
+            return false;
+        };
+        if record.end_offset == up_to && record.hash == *hash {
+            self.confirmed.insert(*start_offset);
+        } else {
+            self.diverged.insert(up_to);
+            diverged.push(up_to);
+        }
+        true
     }
 
-    /// The record of `advance`, `None` when the chain holds it already or a
-    /// segment settled it.
-    pub(crate) fn record_advance(&self, advance: &AdvanceTieredFloor) -> Option<ChainAppend> {
+    /// Settle a recorded advance, or keep it until its segment seals.
+    fn take_advance(&mut self, up_to: u64, hash: [u8; SEGMENT_HASH_SIZE], diverged: &mut Vec<u64>) {
+        if !self.settle_advance(up_to, &hash, diverged) {
+            self.advances.insert(up_to, hash);
+        }
+    }
+
+    /// Settle the advances that waited for the segment `segment` records.
+    /// Only those ending inside it can be affected, so a seal costs the same
+    /// however many advances wait for later segments.
+    fn settle_advances_in(&mut self, segment: &SegmentRecord, diverged: &mut Vec<u64>) {
+        let held: Vec<_> = self
+            .advances
+            .range(segment.start_offset..=segment.end_offset)
+            .map(|(up_to, hash)| (*up_to, *hash))
+            .collect();
+        for (up_to, hash) in held {
+            if self.settle_advance(up_to, &hash, diverged) {
+                self.advances.remove(&up_to);
+            }
+        }
+    }
+
+    /// Whether `advance` still needs a record: the chain does not hold it and
+    /// no segment settled it.
+    pub(crate) fn lacks_advance(&self, advance: &AdvanceTieredFloor) -> bool {
         let settled = self.advances.contains_key(&advance.up_to)
             || self.diverged.contains(&advance.up_to)
             || self
@@ -899,7 +926,14 @@ impl SegmentChain {
                     record.end_offset == advance.up_to && self.confirmed.contains(start_offset)
                 },
             );
-        (!settled).then(|| self.append(ChainRecord::Advanced(*advance)))
+        !settled
+    }
+
+    /// The record of `advance`, `None` when the chain holds it already or a
+    /// segment settled it.
+    pub(crate) fn record_advance(&self, advance: &AdvanceTieredFloor) -> Option<ChainAppend> {
+        self.lacks_advance(advance)
+            .then(|| self.append(ChainRecord::Advanced(*advance)))
     }
 
     /// The last offsets of the advances this replica's segments contradict.
@@ -949,8 +983,9 @@ impl SegmentChain {
 
     /// The chain as a state transfer carries it: the trim point and the latest
     /// record of every live segment, without the records a reader no longer
-    /// needs.
-    fn snapshot(&self) -> Chain {
+    /// needs. `applied` are the advances the partition applied, of which the
+    /// chain may not hold the latest yet.
+    fn snapshot<'a>(&self, applied: impl Iterator<Item = &'a AdvanceTieredFloor>) -> Chain {
         let mut records = Vec::with_capacity(self.sealed.len() + 1);
         records.extend(self.trim_point.map(ChainRecord::TrimPoint));
         records.extend(self.sealed.values().map(|segment| {
@@ -987,6 +1022,13 @@ impl SegmentChain {
                 hash: *hash,
             })
         }));
+        // The receiver starts from a floor that covers every applied advance,
+        // whether or not its record reached this chain before the capture.
+        records.extend(
+            applied
+                .filter(|advance| self.lacks_advance(advance))
+                .map(|advance| ChainRecord::Advanced(*advance)),
+        );
         Chain {
             prefix: self.prefix,
             valid_len: (HEADER_SIZE + records.len() * RECORD_SIZE) as u64,
@@ -1067,16 +1109,19 @@ impl SegmentChain {
     /// record showed this replica's segments to contradict.
     pub(crate) fn note_appended(&mut self, record: &ChainRecord) -> Vec<u64> {
         self.valid_len += RECORD_SIZE as u64;
+        let mut diverged = Vec::new();
         match record {
             ChainRecord::Sealed(segment) => {
                 self.sealed.insert(segment.start_offset, *segment);
+                self.settle_advances_in(segment, &mut diverged);
             }
             ChainRecord::Remote(segment) => {
                 self.sealed.insert(segment.start_offset, *segment);
                 self.remote.insert(segment.start_offset);
+                self.settle_advances_in(segment, &mut diverged);
             }
             ChainRecord::Advanced(advance) => {
-                self.advances.insert(advance.up_to, advance.hash);
+                self.take_advance(advance.up_to, advance.hash, &mut diverged);
             }
             ChainRecord::TrimPoint(offset) => {
                 let trim_point = self
@@ -1090,9 +1135,13 @@ impl SegmentChain {
                     .retain(|start_offset| sealed.contains_key(start_offset));
                 self.confirmed
                     .retain(|start_offset| sealed.contains_key(start_offset));
+                self.advances = trim_point
+                    .checked_add(1)
+                    .map(|kept| self.advances.split_off(&kept))
+                    .unwrap_or_default();
             }
         }
-        self.settle_advances()
+        diverged
     }
 
     fn append(&self, record: ChainRecord) -> ChainAppend {
@@ -1167,7 +1216,9 @@ where
 
     /// What a state transfer carries of the chain, `None` without one.
     pub(crate) fn segment_chain_snapshot(&self) -> Option<Chain> {
-        self.segment_chain.as_ref().map(|chain| chain.snapshot())
+        self.segment_chain
+            .as_ref()
+            .map(|chain| chain.snapshot(self.pending_advances.iter()))
     }
 
     /// The object prefix the chain records, `None` without a chain.

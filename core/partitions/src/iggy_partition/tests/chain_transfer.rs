@@ -18,6 +18,7 @@
 //! A tiered partition's chain crossing a state transfer.
 
 use super::eviction::{KEEP_NOTHING, chain_records, confirm, evict, reboot};
+use super::floor_eviction::advance_over;
 use super::segment_chain::{PREFIX, tiered_partition};
 use super::*;
 use crate::SegmentLocation;
@@ -185,6 +186,28 @@ async fn given_a_confirmed_local_segment_when_its_chain_is_installed_should_let_
     Box::pin(evict(&mut rebooted, u64::MAX, KEEP_NOTHING)).await;
 
     assert_eq!(locations(&rebooted)[2], SegmentLocation::Remote);
+}
+
+/// The plan is pinned in a turn that can come before the I/O lane records an
+/// advance the origin applied. The receiver starts from a floor that covers
+/// the advance, so it never applies it again.
+#[compio::test]
+async fn given_an_advance_not_yet_in_the_chain_when_its_chain_is_installed_should_let_the_receiver_evict_the_segment()
+ {
+    let (directory, origin) = Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let mut origin = Box::new(origin);
+    let advance = Box::pin(advance_over(directory.path(), (0, 1))).await;
+    origin.note_tiered_advance(advance);
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut receiver) = Box::pin(receiver_on_disk(root.path())).await;
+    Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
+    drop(receiver);
+
+    let mut rebooted = Box::pin(reboot(&config)).await;
+    Box::pin(evict(&mut rebooted, u64::MAX, KEEP_NOTHING)).await;
+
+    assert_eq!(locations(&rebooted)[0], SegmentLocation::Remote);
 }
 
 /// A rebuilt replica holds the sender's records and front, keeps no tiered

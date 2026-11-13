@@ -183,8 +183,8 @@ where
     /// Where polls read segments whose `.log` left the disk.
     remote_segments: Option<Rc<crate::RemoteSegments>>,
     /// The floor advances this replica applied that its chain does not record
-    /// yet, oldest first.
-    pending_advances: VecDeque<crate::tiered_floor::AdvanceTieredFloor>,
+    /// yet, oldest first. Recorded ones leave from the front.
+    pub(crate) pending_advances: VecDeque<crate::tiered_floor::AdvanceTieredFloor>,
     /// How much of the partition stays on local disk, as the segment cleaner
     /// last resolved it from the topic. `None` until it has.
     local_envelope: Option<LocalEnvelope>,
@@ -1998,6 +1998,7 @@ where
         (self.fatal.is_none()
             && self.maintenance.checkpoint.is_none()
             && !self.checkpoint_waits_for_commit()
+            && !self.checkpoint_waits_for_advances()
             && persistence.needs_checkpoint()
             && through_op > persistence.checkpoint_op()
             && through_op <= persistence.head())
@@ -13047,13 +13048,39 @@ where
         if self.maintenance.tiering.is_none() {
             return false;
         }
+        self.drop_recorded_advances();
         if self.next_tiering_job().is_none() {
             self.maintenance.tiering = None;
-            // Whatever is left is in the chain, or a segment settled it.
+            // No chain can be opened here, so nothing ever records these.
             self.pending_advances.clear();
             return false;
         }
         true
+    }
+
+    /// Drop the leading advances that the chain holds or a segment settled,
+    /// so that choosing the next job looks at one advance however many wait.
+    fn drop_recorded_advances(&mut self) {
+        let Some(chain) = self.segment_chain.as_ref() else {
+            return;
+        };
+        while self
+            .pending_advances
+            .front()
+            .is_some_and(|advance| !chain.lacks_advance(advance))
+        {
+            self.pending_advances.pop_front();
+        }
+    }
+
+    /// A checkpoint keeps the floor and lets the WAL drop the advances that
+    /// moved it. One taken before the chain holds them would leave a restarted
+    /// replica unable to evict their segments, or any segment after them. It
+    /// waits only while the I/O lane is about to record them.
+    fn checkpoint_waits_for_advances(&self) -> bool {
+        self.has_io_dispatcher()
+            && self.maintenance.tiering.is_some()
+            && !self.pending_advances.is_empty()
     }
 
     /// Take a floor advance this replica applied. The store holds the
@@ -13133,10 +13160,12 @@ where
         {
             return Some(crate::segment_chain::TieringJob::Append(append));
         }
+        // Advances apply in offset order, and the recorded ones were dropped
+        // from the front.
         if let Some(append) = self
             .pending_advances
-            .iter()
-            .find_map(|advance| chain.record_advance(advance))
+            .front()
+            .and_then(|advance| chain.record_advance(advance))
         {
             return Some(crate::segment_chain::TieringJob::Append(append));
         }
