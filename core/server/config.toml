@@ -1378,7 +1378,9 @@ handshake_grace = "10 s"
 # stops the node.
 #
 # The free space is the last sample of the disk, taken once a second, minus
-# what the node wrote since, so a burst between two samples is counted. A
+# what the node wrote since, so a burst between two samples is counted, and
+# minus the messages the node accepted and has not written yet, so the WAL
+# backlogs of its partitions cannot write through the reserve together. A
 # backup does not refuse what its primary replicates: give every node of a
 # cluster the same disk size, or watch 'data_disk_below_free_space_reserve' on
 # each node.

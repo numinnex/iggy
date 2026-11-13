@@ -3639,6 +3639,7 @@ where
                 base.checked_add(self.offset_cleanup_charge(kind)?)?
                     .checked_add(retained.checked_mul(size_of::<u32>())?)
             }
+            InstallPhase::Backup => base.checked_add(crate::install_backup::COPY_BUFFER_BYTES),
             InstallPhase::RetryCheckpoint => base.checked_add(pending.retry_checkpoint.capacity()),
             InstallPhase::Converge => ConsumerKind::ALL.into_iter().try_fold(
                 base.checked_add(size_of::<[HashSet<u32>; ConsumerKind::COUNT]>())?,

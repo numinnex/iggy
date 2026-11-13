@@ -314,7 +314,8 @@ impl IggyClient {
     /// `segment_max_age_micros` starts a new segment once a batch arrives this long after the
     /// active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
     /// segments by size alone. The server refuses a duration together with
-    /// `preallocate_segments`.
+    /// `preallocate_segments`. It follows `raw`, so positional calls written before it existed
+    /// keep their meaning, and so do the three options below.
     ///
     /// `tiered_storage` moves sealed segments to the object store. Null leaves it off, and the
     /// server refuses true with `Feature is unavailable` until it tiers topics.
@@ -339,11 +340,11 @@ impl IggyClient {
         preallocate_segments: Option<bool>,
         partition_resize_policy: Option<String>,
         replication_factor: Option<&Zval>,
+        raw: Option<BTreeMap<String, String>>,
         segment_max_age_micros: Option<&Zval>,
         tiered_storage: Option<bool>,
         local_retention_age_micros: Option<&Zval>,
         local_retention_size: Option<&Zval>,
-        raw: Option<BTreeMap<String, String>>,
     ) -> PhpResult {
         let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
         let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?;
