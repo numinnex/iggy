@@ -262,6 +262,56 @@ async fn given_an_eviction_cut_short_before_its_unlink_when_offering_should_send
     assert_eq!(layout(&receiver), layout(&origin));
 }
 
+/// A chain as the file holds it, with a segment's sealed record ahead of its
+/// remote one and a segment the trim point retired: the install plants,
+/// counts and keeps the latest record of each live segment.
+#[compio::test]
+async fn given_a_chain_with_superseded_records_when_installed_should_keep_the_latest_of_each() {
+    let (_origin_directory, mut origin) = Box::pin(tiered_origin()).await;
+    let first_end = origin.sealed_segment_record(0).unwrap().end_offset;
+    let retired = origin.sealed_segment_record(0).unwrap();
+    Box::pin(origin.remove_sealed_segments_up_to(first_end)).await;
+    Box::pin(settle_partition_io(&mut origin, &repair_config())).await;
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+    let sealed = [2, 4].map(|start| origin.sealed_segment_record(start).unwrap());
+    let mut chain = offered_chain(&offer);
+    chain.records = vec![
+        ChainRecord::Sealed(retired),
+        ChainRecord::Sealed(sealed[0]),
+        ChainRecord::Remote(retired),
+        ChainRecord::Sealed(sealed[1]),
+        ChainRecord::TrimPoint(first_end),
+        ChainRecord::Remote(sealed[0]),
+    ];
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut receiver) = Box::pin(receiver_on_disk(root.path())).await;
+
+    Box::pin(install_with_chain(&mut receiver, &offer, &chain.encode()))
+        .await
+        .unwrap();
+    Box::pin(finish_install_io(&mut receiver)).await.unwrap();
+
+    assert_eq!(layout(&receiver), layout(&origin));
+    assert_eq!(receiver.chain_trim_point(), Some(first_end));
+    assert!(receiver.sealed_segment_record(0).is_none());
+    for record in sealed {
+        assert_eq!(
+            receiver.sealed_segment_record(record.start_offset),
+            Some(record)
+        );
+    }
+    assert_eq!(
+        receiver.stats.size_bytes_inconsistent(),
+        origin.stats.size_bytes_inconsistent()
+    );
+    assert_eq!(
+        receiver.stats.messages_count_inconsistent(),
+        origin.stats.messages_count_inconsistent()
+    );
+    let directory = PathBuf::from(config.get_partition_path(1, 1, 0));
+    assert_eq!(chain_records(&directory).await, chain.records);
+}
+
 /// The trim point travels, so the receiver's boot accepts the same front.
 #[compio::test]
 async fn given_a_chain_with_a_trim_point_when_installed_should_keep_it() {
