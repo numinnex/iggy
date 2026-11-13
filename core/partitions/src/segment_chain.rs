@@ -587,6 +587,9 @@ where
                     recorded: chain.prefix,
                 });
             }
+            // The chain may be here by a rename no directory sync followed, and
+            // a record appended to a name a power loss takes back is lost.
+            crate::state_transfer::fsync_dir(&directory).await?;
             chain
         } else {
             create_chain(&directory, &prefix).await?;

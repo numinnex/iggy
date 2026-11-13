@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::fs::Permissions;
+use std::os::unix::fs::PermissionsExt;
+
 use super::*;
 use crate::SegmentLocation;
 use crate::segment_chain::{
-    ChainError, ChainRecord, HashSource, ObjectPrefix, hash_segment_file, read_chain,
+    ChainError, ChainRecord, HashSource, ObjectPrefix, chain_path, hash_segment_file, read_chain,
 };
 
 const PREFIX: ObjectPrefix = ObjectPrefix {
@@ -277,6 +280,43 @@ async fn given_a_chain_on_disk_when_a_partition_reopens_it_should_know_the_seale
         Box::pin(other.open_segment_chain(foreign)).await,
         Err(ChainError::Prefix { recorded }) if recorded == PREFIX
     ));
+}
+
+/// A creation whose directory sync failed leaves a chain whose name may not
+/// survive a power loss, so opening it again has to sync the directory too.
+#[compio::test]
+async fn given_a_chain_whose_directory_sync_failed_when_reopened_should_sync_before_accepting_it() {
+    const NO_DIRECTORY_READ: u32 = 0o300;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().to_string_lossy().into_owned();
+    let mut partition = Box::new(test_partition_with_replicas(3));
+    partition.set_partition_dir(path.clone());
+    let mode = std::fs::metadata(directory.path())
+        .unwrap()
+        .permissions()
+        .mode();
+    std::fs::set_permissions(directory.path(), Permissions::from_mode(NO_DIRECTORY_READ)).unwrap();
+    let directory_read_denied = std::fs::File::open(directory.path()).is_err();
+
+    let created = Box::pin(partition.open_segment_chain(PREFIX)).await;
+    let renamed = std::fs::metadata(chain_path(&path)).is_ok();
+    let retried = Box::pin(partition.open_segment_chain(PREFIX)).await;
+    let accepted = partition.object_prefix();
+    std::fs::set_permissions(directory.path(), Permissions::from_mode(mode)).unwrap();
+    // Root ignores the mode, so the directory sync cannot be made to fail.
+    if !directory_read_denied {
+        return;
+    }
+
+    assert!(matches!(created, Err(ChainError::Io(_))));
+    assert!(renamed, "the creation must fail after its rename");
+    assert!(matches!(retried, Err(ChainError::Io(_))));
+    assert_eq!(accepted, None);
+
+    Box::pin(partition.open_segment_chain(PREFIX))
+        .await
+        .unwrap();
+    assert_eq!(partition.object_prefix(), Some(PREFIX));
 }
 
 async fn polled(
