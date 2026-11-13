@@ -124,20 +124,21 @@ pub fn stage_owned_partitions(
                 now,
                 local_envelope(age, size, partition_count),
             );
-            let committed_up_to = streams
-                .with_committed_partition(namespace, |partition| partition.deleted_up_to_offset)
-                .unwrap_or_default();
+            // One lookup, so both passes name the incarnation the watermark
+            // was read for.
+            let Some((created_revision, committed_up_to)) = streams
+                .with_committed_partition(namespace, |partition| {
+                    (partition.created_revision, partition.deleted_up_to_offset)
+                })
+            else {
+                continue;
+            };
             // Staged after the loop, where the shard orders them.
-            tiered.push((namespace, committed_up_to));
+            tiered.push((namespace, created_revision, committed_up_to));
             // Retention of a tiered topic covers its remote segments too, so
             // no replica expires its own: the partition primary decides, and
             // the decision reaches every replica as a committed truncation.
-            if (has_expiry || budget.is_some())
-                && let Some((created_revision, committed_up_to)) = streams
-                    .with_committed_partition(namespace, |partition| {
-                        (partition.created_revision, partition.deleted_up_to_offset)
-                    })
-            {
+            if has_expiry || budget.is_some() {
                 shard.request_retain_partition(
                     namespace,
                     created_revision,

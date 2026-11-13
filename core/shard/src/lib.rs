@@ -1195,6 +1195,11 @@ pub enum LifecycleFrame {
     /// nothing on a shard without an uploader.
     UploadSegments {
         namespace: IggyNamespace,
+        /// The incarnation the pass was staged for. Slab ids are reused after
+        /// a delete, so by the time the pump takes the frame the namespace
+        /// can name a recreated partition that `committed_up_to` says
+        /// nothing about.
+        created_revision: u64,
         /// Whether the pass also sends the floor advance that a stored
         /// segment still owes. The pass that follows a finished upload leaves
         /// it out, since that advance was sent a moment ago.

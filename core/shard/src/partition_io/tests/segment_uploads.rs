@@ -39,6 +39,17 @@ fn namespace() -> IggyNamespace {
     IggyNamespace::new(0, 0, 0)
 }
 
+/// The incarnation of the fixture's partition, which its passes are staged
+/// for.
+fn staged_revision(owner: &IoTestShard) -> u64 {
+    owner
+        .plane
+        .partitions()
+        .get_by_ns(&namespace())
+        .unwrap()
+        .created_revision()
+}
+
 /// What the fixture's store does with an upload.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Store {
@@ -272,7 +283,9 @@ async fn given_no_uploader_when_an_upload_pass_runs_should_start_no_upload() {
     let directory = tempfile::tempdir().unwrap();
     let owner = Box::pin(sealed_owner(directory.path())).await;
 
-    owner.on_upload_segments(namespace(), true, None).await;
+    owner
+        .on_upload_segments(namespace(), staged_revision(&owner), true, None)
+        .await;
 
     assert!(!upload_in_flight(&owner));
 }
@@ -569,6 +582,7 @@ fn staged_passes(owner: &IoTestShard) -> Vec<IggyNamespace> {
             namespace,
             resend_advance: true,
             committed_up_to: Some(_),
+            ..
         })) => Some(namespace),
         Ok(_) => panic!("only timed upload passes are on their way"),
         Err(_) => None,
@@ -585,13 +599,13 @@ async fn given_a_sealed_segment_when_timed_passes_run_should_report_its_age_unti
     pumped(&owner, async {
         seal_segments(&owner).await;
         let now = after_oldest_segment(&owner, Duration::from_secs(5));
-        owner.request_upload_passes(&[(namespace(), 0)], now);
+        owner.request_upload_passes(&[(namespace(), staged_revision(&owner), 0)], now);
         assert_eq!(owner.metrics().segment_upload_lag_seconds_value(), 5);
 
         owner.set_segment_uploader(Some(uploader.clone()));
         owner.request_upload_segments(namespace());
         until(&owner, |owner| floor(owner) == Some(SEALED_SEGMENTS - 1)).await;
-        owner.request_upload_passes(&[(namespace(), 0)], now);
+        owner.request_upload_passes(&[(namespace(), staged_revision(&owner), 0)], now);
         assert_eq!(owner.metrics().segment_upload_lag_seconds_value(), 0);
     })
     .await;
@@ -604,7 +618,10 @@ async fn given_a_lag_over_the_alarm_line_when_timed_passes_run_should_hold_the_a
     let owner = Box::pin(sealed_owner(directory.path())).await;
     // The partition without a backlog comes last, and must not hide the lag
     // of the one before it.
-    let passes = [(namespace(), 0), (IggyNamespace::new(0, 0, 1), 0)];
+    let passes = [
+        (namespace(), staged_revision(&owner), 0),
+        (IggyNamespace::new(0, 0, 1), 0, 0),
+    ];
     let lagging = |owner: &IoTestShard| owner.upload_pacing.borrow().is_lagging(namespace());
     let under = after_oldest_segment(
         &owner,
@@ -612,7 +629,7 @@ async fn given_a_lag_over_the_alarm_line_when_timed_passes_run_should_hold_the_a
     );
     let over = after_oldest_segment(&owner, UPLOAD_LAG_ALARM);
 
-    owner.request_upload_passes(&[(namespace(), 0)], under);
+    owner.request_upload_passes(&[(namespace(), staged_revision(&owner), 0)], under);
     assert!(!lagging(&owner));
     owner.request_upload_passes(&passes, over);
     assert!(lagging(&owner));
@@ -643,7 +660,10 @@ async fn given_a_partition_whose_eviction_waits_when_timed_passes_are_staged_sho
     assert!(owner.plane.partitions().get_by_ns(&other).is_some());
     let now = IggyTimestamp::now();
 
-    owner.request_upload_passes(&[(other, 0), (namespace(), 0)], now);
+    owner.request_upload_passes(
+        &[(other, 0, 0), (namespace(), staged_revision(&owner), 0)],
+        now,
+    );
     assert_eq!(
         staged_passes(&owner),
         [other, namespace()],
@@ -659,7 +679,10 @@ async fn given_a_partition_whose_eviction_waits_when_timed_passes_are_staged_sho
             age: IggyExpiry::NeverExpire,
             size: Some(0),
         }));
-    owner.request_upload_passes(&[(other, 0), (namespace(), 0)], now);
+    owner.request_upload_passes(
+        &[(other, 0, 0), (namespace(), staged_revision(&owner), 0)],
+        now,
+    );
     assert_eq!(staged_passes(&owner), [namespace(), other]);
 }
 
@@ -671,7 +694,10 @@ async fn given_a_partition_that_is_gone_when_timed_passes_are_staged_should_stil
     let owner = Box::pin(sealed_owner(directory.path())).await;
     let absent = IggyNamespace::new(9, 9, 9);
 
-    owner.request_upload_passes(&[(absent, 0), (namespace(), 0)], IggyTimestamp::now());
+    owner.request_upload_passes(
+        &[(absent, 0, 0), (namespace(), staged_revision(&owner), 0)],
+        IggyTimestamp::now(),
+    );
 
     assert_eq!(staged_passes(&owner), [absent, namespace()]);
 }
@@ -683,7 +709,9 @@ async fn given_a_stored_segment_when_its_upload_finishes_should_stage_the_next_p
     let owner = Box::pin(sealed_owner(directory.path())).await;
     owner.set_segment_uploader(Some(RecordingUploader::new(Store::Stores)));
 
-    owner.on_upload_segments(namespace(), true, None).await;
+    owner
+        .on_upload_segments(namespace(), staged_revision(&owner), true, None)
+        .await;
     let finished = finished_upload(&owner).await;
     owner.on_segment_upload_finished(finished).await;
 
@@ -691,9 +719,10 @@ async fn given_a_stored_segment_when_its_upload_finishes_should_stage_the_next_p
         owner.inbox.try_recv(),
         Ok(ShardFrame::Lifecycle(LifecycleFrame::UploadSegments {
             namespace: staged,
+            created_revision,
             resend_advance: false,
             committed_up_to: None,
-        })) if staged == namespace()
+        })) if staged == namespace() && created_revision == staged_revision(&owner)
     ));
     assert_eq!(locations(&owner)[0], SegmentLocation::Uploaded);
 }
@@ -705,7 +734,9 @@ async fn given_a_result_of_another_incarnation_when_it_arrives_should_not_settle
     let directory = tempfile::tempdir().unwrap();
     let owner = Box::pin(sealed_owner(directory.path())).await;
     owner.set_segment_uploader(Some(RecordingUploader::new(Store::Hangs)));
-    owner.on_upload_segments(namespace(), true, None).await;
+    owner
+        .on_upload_segments(namespace(), staged_revision(&owner), true, None)
+        .await;
     let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
     let created_revision = partition.created_revision();
     let attempt = partition.segment_upload_attempt().unwrap();
@@ -748,7 +779,9 @@ async fn given_a_full_inbox_when_an_upload_finishes_should_settle_it_on_the_next
         .is_ok()
     {}
 
-    owner.on_upload_segments(namespace(), true, None).await;
+    owner
+        .on_upload_segments(namespace(), staged_revision(&owner), true, None)
+        .await;
     until(&owner, |owner| {
         !owner.undelivered_segment_uploads.borrow().is_empty()
     })
@@ -756,7 +789,9 @@ async fn given_a_full_inbox_when_an_upload_finishes_should_settle_it_on_the_next
     assert!(upload_in_flight(&owner));
     assert_eq!(locations(&owner), [SegmentLocation::Local; 3]);
 
-    owner.on_upload_segments(namespace(), true, None).await;
+    owner
+        .on_upload_segments(namespace(), staged_revision(&owner), true, None)
+        .await;
 
     assert!(owner.undelivered_segment_uploads.borrow().is_empty());
     assert_eq!(locations(&owner)[0], SegmentLocation::Uploaded);
@@ -823,6 +858,7 @@ async fn given_a_stored_segment_whose_advance_was_lost_when_a_timed_pass_runs_sh
         owner.senders[0]
             .try_send(ShardFrame::lifecycle(LifecycleFrame::UploadSegments {
                 namespace: namespace(),
+                created_revision: staged_revision(&owner),
                 resend_advance: false,
                 committed_up_to: None,
             }))
@@ -1005,7 +1041,9 @@ async fn given_a_trim_point_nothing_committed_when_timed_passes_run_should_propo
         .unwrap()
         .created_revision();
 
-    owner.on_upload_segments(namespace(), true, Some(0)).await;
+    owner
+        .on_upload_segments(namespace(), staged_revision(&owner), true, Some(0))
+        .await;
     assert_eq!(
         retention_truncate(&owner),
         None,
@@ -1015,17 +1053,26 @@ async fn given_a_trim_point_nothing_committed_when_timed_passes_run_should_propo
     let uploader = RecordingUploader::new(Store::Hangs);
     owner.set_segment_uploader(Some(uploader.clone()));
     // The pass a seal or a stored upload stages knows no watermark.
-    owner.on_upload_segments(namespace(), false, None).await;
+    owner
+        .on_upload_segments(namespace(), staged_revision(&owner), false, None)
+        .await;
     assert_eq!(retention_truncate(&owner), None);
     assert_eq!(uploader.started(), Vec::<u64>::new());
 
-    owner.on_upload_segments(namespace(), true, Some(0)).await;
+    owner
+        .on_upload_segments(namespace(), staged_revision(&owner), true, Some(0))
+        .await;
     assert_eq!(
         retention_truncate(&owner),
         Some((created_revision, trim_point))
     );
     owner
-        .on_upload_segments(namespace(), true, Some(trim_point - 1))
+        .on_upload_segments(
+            namespace(),
+            staged_revision(&owner),
+            true,
+            Some(trim_point - 1),
+        )
         .await;
     assert_eq!(
         retention_truncate(&owner),
@@ -1034,13 +1081,69 @@ async fn given_a_trim_point_nothing_committed_when_timed_passes_run_should_propo
     assert_eq!(uploader.started(), Vec::<u64>::new());
 
     owner
-        .on_upload_segments(namespace(), true, Some(trim_point))
+        .on_upload_segments(namespace(), staged_revision(&owner), true, Some(trim_point))
         .await;
     assert_eq!(
         retention_truncate(&owner),
         None,
         "the truncation is committed, so it is not asked for again"
     );
+    until(&owner, |_| uploader.started() == [trim_point + 1]).await;
+}
+
+/// The timer task reads a watermark for one incarnation, and the pump can take
+/// the frame after the topic was deleted and its slots were given to another.
+#[compio::test]
+async fn given_an_upload_pass_of_another_incarnation_when_it_runs_should_neither_note_its_watermark_nor_commit()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, trim_point) = Box::pin(owner_with_uncommitted_trim_point(directory.path())).await;
+    let uploader = RecordingUploader::new(Store::Hangs);
+    owner.set_segment_uploader(Some(uploader.clone()));
+    let stale_revision = staged_revision(&owner);
+    // The partition the slots hold now is not the one the passes were staged
+    // for, and nothing committed its trim point as deleted.
+    let created_revision = stale_revision + 1;
+    owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .set_created_revision(created_revision);
+
+    // A watermark below the trim point would have the recreated topic
+    // truncated on the word of the deleted one.
+    owner
+        .on_upload_segments(namespace(), stale_revision, true, Some(0))
+        .await;
+    assert_eq!(retention_truncate(&owner), None);
+    // One that covers the trim point would let an advance pass over offsets
+    // nothing committed as deleted here.
+    owner
+        .on_upload_segments(namespace(), stale_revision, true, Some(trim_point))
+        .await;
+    owner
+        .on_upload_segments(namespace(), stale_revision, false, None)
+        .await;
+    let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+    assert!(
+        partition.segment_upload_attempt().is_none(),
+        "no upload starts on a watermark of another incarnation"
+    );
+    assert_eq!(partition.trim_point_to_commit(0), Some(trim_point));
+    assert!(partition.pending_floor_advance().is_none());
+
+    // A pass staged for the incarnation the slots hold still works.
+    owner
+        .on_upload_segments(namespace(), created_revision, true, Some(0))
+        .await;
+    assert_eq!(
+        retention_truncate(&owner),
+        Some((created_revision, trim_point))
+    );
+    owner
+        .on_upload_segments(namespace(), created_revision, true, Some(trim_point))
+        .await;
     until(&owner, |_| uploader.started() == [trim_point + 1]).await;
 }
 
@@ -1054,7 +1157,7 @@ async fn given_a_committed_trim_point_when_a_pass_without_the_watermark_follows_
     let failed_at = Instant::now();
 
     owner
-        .on_upload_segments(namespace(), true, Some(trim_point))
+        .on_upload_segments(namespace(), staged_revision(&owner), true, Some(trim_point))
         .await;
     let finished = finished_upload(&owner).await;
     owner.segment_upload_finished_at(finished, failed_at).await;

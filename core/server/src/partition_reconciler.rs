@@ -5102,10 +5102,21 @@ mod tests {
         while let Ok(frame) = lanes.main.try_recv() {
             if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::UploadSegments {
                 namespace,
+                created_revision,
                 resend_advance: true,
                 committed_up_to: Some(0),
             }) = frame
             {
+                assert_eq!(
+                    Some(created_revision),
+                    shard
+                        .plane
+                        .metadata()
+                        .mux_stm
+                        .streams()
+                        .created_revision_for_namespace(namespace),
+                    "the pass names the incarnation its watermark was read for"
+                );
                 upload_passes.push(namespace);
             }
         }
