@@ -1067,6 +1067,37 @@ struct ConsumerTests {
         await server.stop()
     }
 
+    /// A stop during the gap read leaves the partition to a seek, which
+    /// drops the gap and the batch held behind it, and a seek to `next` reads
+    /// after both. So the stop reports the range once and delivers that
+    /// batch before its own error.
+    @Test func aStopDuringAGapReadReportsTheRangeAndDeliversTheHeldBatchFirst() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 6])
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.pollMessagesDeferred.rawValue, !polledStrategy(request).autoCommit else {
+                return nil
+            }
+            return .status(IggyErrorCode.tieredReadFailed.rawValue)
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, commit: .onRead)
+        #expect(try await batches(reader, 1) == [[0, 1]])
+        topic.loseReplies(1)
+
+        let lost = try #require(await readError(reader), "the gap that the stop gave up was not reported")
+        #expect(lost.partitionID == 1 && lost.error.code == .fetchProgressUncertain)
+        #expect(lost.lost == 2...3)
+        #expect(try await batches(reader, 1) == [[4, 5]])
+        let stop = try #require(await readError(reader), "the stop was not reported")
+        #expect(stop.partitionID == 1 && stop.error.code == .tieredReadFailed)
+        #expect(stop.stopsPartition)
+        #expect(await requests(server, .pollMessagesDeferred).count == 1)
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
     /// A gap read that the history answers from inside the gap finds the
     /// start of the gap gone, as after retention. The reader reports that
     /// start once, then delivers the rest of the gap and the batch after it.

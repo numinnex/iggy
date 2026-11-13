@@ -2366,8 +2366,7 @@ public actor PartitionReader: AsyncSequence {
         case .historyUnavailable:
             for partition in partitions {
                 if positions[partition]?.context != nil {
-                    stopped.insert(partition)
-                    report(ReadError(partitionID: partition, error: error, stopsPartition: true))
+                    stop(partition, with: error)
                 } else {
                     forget(partition)
                     pausedUntil[partition] = until
@@ -2379,8 +2378,7 @@ public actor PartitionReader: AsyncSequence {
             // The object store refused the read for good, so the same read
             // gets the same answer: the partition stops at the first one.
             for partition in partitions {
-                stopped.insert(partition)
-                report(ReadError(partitionID: partition, error: error, stopsPartition: true))
+                stop(partition, with: error)
             }
             return
         case .consumerGroupMemberNotFound:
@@ -2410,6 +2408,19 @@ public actor PartitionReader: AsyncSequence {
         }
         logger.error("Failed to read messages", metadata: metadata.merging(["partitions": "\(partitions)", "error": "\(error)"]) { $1 })
         report(ReadError(partitionID: partitions.count == 1 ? partitions.first : nil, error: error, stopsPartition: stops))
+    }
+
+    /// Stops `partition` until a seek and queues `error` for ``next()``. A
+    /// seek drops the gap of the partition and the replies held behind it,
+    /// and a seek to `next` then reads after both. So the stop gives the gap
+    /// up first: its range is reported as lost and those replies are queued
+    /// before `error`.
+    private func stop(_ partition: UInt32, with error: IggyError) {
+        if let gap = gaps.removeValue(forKey: partition) {
+            giveUp(gap, of: partition)
+        }
+        stopped.insert(partition)
+        report(ReadError(partitionID: partition, error: error, stopsPartition: true))
     }
 
     /// Groups the partitions again, and `partitions` read again once a lookup
