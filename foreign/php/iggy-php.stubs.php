@@ -178,7 +178,8 @@ namespace Iggy {
          * `segment_max_age_micros` starts a new segment once a batch arrives this long after the
          * active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
          * segments by size alone. The server refuses a duration together with
-         * `preallocate_segments`.
+         * `preallocate_segments`. It follows `raw`, so positional calls written before it existed
+         * keep their meaning.
          *
          * @param mixed $stream
          * @param string $name
@@ -194,11 +195,11 @@ namespace Iggy {
          * @param bool|null $preallocate_segments
          * @param string|null $partition_resize_policy
          * @param mixed $replication_factor
-         * @param mixed $segment_max_age_micros
          * @param array|null $raw
+         * @param mixed $segment_max_age_micros
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, mixed $segment_max_age_micros = null, ?array $raw = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, ?array $raw = null, mixed $segment_max_age_micros = null): void {}
 
         /**
          * Deletes the offset stored on `partition_id` for a standalone consumer, or for a consumer

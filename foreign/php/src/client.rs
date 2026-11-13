@@ -314,7 +314,8 @@ impl IggyClient {
     /// `segment_max_age_micros` starts a new segment once a batch arrives this long after the
     /// active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
     /// segments by size alone. The server refuses a duration together with
-    /// `preallocate_segments`.
+    /// `preallocate_segments`. It follows `raw`, so positional calls written before it existed
+    /// keep their meaning.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -332,8 +333,8 @@ impl IggyClient {
         preallocate_segments: Option<bool>,
         partition_resize_policy: Option<String>,
         replication_factor: Option<&Zval>,
-        segment_max_age_micros: Option<&Zval>,
         raw: Option<BTreeMap<String, String>>,
+        segment_max_age_micros: Option<&Zval>,
     ) -> PhpResult {
         let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
         let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?;
