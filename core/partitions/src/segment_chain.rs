@@ -603,6 +603,70 @@ impl ChunkHasher for SegmentDigest {
     }
 }
 
+/// A chain reduced to its trim point and the latest record of every segment
+/// the trim point has not retired. Building it walks every record, so a reader
+/// that needs it more than once keeps it.
+pub(crate) struct LiveChain {
+    prefix: ObjectPrefix,
+    valid_len: u64,
+    trim_point: Option<u64>,
+    sealed: BTreeMap<u64, SegmentRecord>,
+    /// The segments in `sealed` whose latest record is remote.
+    remote: BTreeSet<u64>,
+}
+
+impl LiveChain {
+    pub(crate) fn new(chain: &Chain) -> Self {
+        let trim_point = chain.trim_point();
+        let mut latest: Vec<(&SegmentRecord, bool)> = chain
+            .records
+            .iter()
+            .filter_map(|record| {
+                let segment = record.segment()?;
+                trim_point
+                    .is_none_or(|trim_point| segment.end_offset > trim_point)
+                    .then_some((segment, matches!(record, ChainRecord::Remote(_))))
+            })
+            .collect();
+        // Sorted and deduplicated up front, so both collections below are
+        // built in one linear pass instead of an insert per record. The sort
+        // is stable and the walk is reversed, so the record kept for a start
+        // offset is the last the chain holds for it.
+        latest.sort_by_key(|(segment, _)| segment.start_offset);
+        latest.reverse();
+        latest.dedup_by_key(|(segment, _)| segment.start_offset);
+        latest.reverse();
+        Self {
+            prefix: chain.prefix,
+            valid_len: chain.valid_len,
+            trim_point,
+            sealed: latest
+                .iter()
+                .map(|(segment, _)| (segment.start_offset, **segment))
+                .collect(),
+            remote: latest
+                .iter()
+                .filter(|(_, remote)| *remote)
+                .map(|(segment, _)| segment.start_offset)
+                .collect(),
+        }
+    }
+
+    pub(crate) const fn trim_point(&self) -> Option<u64> {
+        self.trim_point
+    }
+
+    /// The segments whose latest record is remote, in offset order.
+    pub(crate) fn remote_segments(&self) -> Vec<SegmentRecord> {
+        let mut remote = self.remote.iter().peekable();
+        self.sealed
+            .iter()
+            .filter(|(start_offset, _)| remote.next_if_eq(start_offset).is_some())
+            .map(|(_, segment)| *segment)
+            .collect()
+    }
+}
+
 /// What a partition with a chain keeps of it between appends.
 pub(crate) struct SegmentChain {
     path: String,
@@ -701,17 +765,7 @@ impl EvictionJob {
 }
 
 impl SegmentChain {
-    fn load(path: String, chain: &Chain, active: Option<&Segment>) -> Self {
-        let mut sealed = BTreeMap::new();
-        let mut remote = BTreeSet::new();
-        for (start_offset, record) in chain.live_segments() {
-            if matches!(record, ChainRecord::Remote(_)) {
-                remote.insert(start_offset);
-            }
-            if let Some(segment) = record.segment() {
-                sealed.insert(start_offset, *segment);
-            }
-        }
+    fn load(path: String, chain: LiveChain, active: Option<&Segment>) -> Self {
         let digest = active
             .filter(|active| active.size.as_bytes_u64() == 0)
             .map(|active| Box::new(SegmentDigest::new(active.start_offset)));
@@ -719,10 +773,10 @@ impl SegmentChain {
             path,
             prefix: chain.prefix,
             valid_len: chain.valid_len,
-            sealed,
-            remote,
+            sealed: chain.sealed,
+            remote: chain.remote,
             confirmed: BTreeSet::new(),
-            trim_point: chain.trim_point(),
+            trim_point: chain.trim_point,
             digest,
         }
     }
@@ -772,11 +826,16 @@ impl SegmentChain {
     /// The chain as a state transfer carries it: the trim point and the latest
     /// record of every live segment, without the records a reader no longer
     /// needs.
-    fn snapshot(&self) -> Chain {
+    ///
+    /// A segment is remote only when `without_log`, ascending, holds its start
+    /// offset. The chain's own remote records do not decide it: an eviction cut
+    /// short after its record leaves the `.log` in place, and that segment
+    /// travels as bytes.
+    fn snapshot(&self, without_log: &[u64]) -> Chain {
         let mut records = Vec::with_capacity(self.sealed.len() + 1);
         records.extend(self.trim_point.map(ChainRecord::TrimPoint));
         records.extend(self.sealed.values().map(|segment| {
-            if self.remote.contains(&segment.start_offset) {
+            if without_log.binary_search(&segment.start_offset).is_ok() {
                 ChainRecord::Remote(*segment)
             } else {
                 ChainRecord::Sealed(*segment)
@@ -908,6 +967,11 @@ where
     /// [`ChainError::Prefix`] when the chain names another partition or
     /// incarnation.
     pub fn adopt_segment_chain(&mut self, chain: &Chain) -> Result<(), ChainError> {
+        self.adopt_live_chain(LiveChain::new(chain))
+    }
+
+    /// [`Self::adopt_segment_chain`] of a chain already reduced.
+    pub(crate) fn adopt_live_chain(&mut self, chain: LiveChain) -> Result<(), ChainError> {
         let directory = self
             .partition_dir
             .as_deref()
@@ -945,8 +1009,12 @@ where
     }
 
     /// What a state transfer carries of the chain, `None` without one.
-    pub(crate) fn segment_chain_snapshot(&self) -> Option<Chain> {
-        self.segment_chain.as_ref().map(|chain| chain.snapshot())
+    /// `without_log` holds the start offsets of the segments the same transfer
+    /// sends no bytes for, ascending.
+    pub(crate) fn segment_chain_snapshot(&self, without_log: &[u64]) -> Option<Chain> {
+        self.segment_chain
+            .as_ref()
+            .map(|chain| chain.snapshot(without_log))
     }
 
     /// The object prefix the chain records, `None` without a chain.
