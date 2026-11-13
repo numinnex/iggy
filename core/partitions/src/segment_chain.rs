@@ -33,6 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
+use std::path::Path;
 
 use compio::io::AsyncWriteAtExt;
 use consensus::state_artifact_checksum;
@@ -45,7 +46,7 @@ use tracing::warn;
 
 use crate::IggyPartition;
 use crate::segment::Segment;
-use crate::state_transfer::{ChunkHasher, STAGING_SUFFIX, hash_segment_range};
+use crate::state_transfer::{ChunkHasher, STAGING_SUFFIX, fsync_dir, hash_segment_range};
 
 #[cfg(test)]
 mod tests;
@@ -601,6 +602,8 @@ pub enum EvictionFailure {
     Record,
     /// The record is durable, but the `.log` is still there.
     Unlink,
+    /// The `.log` is unlinked, but a power loss may bring it back.
+    Sync,
 }
 
 impl EvictionJob {
@@ -621,14 +624,7 @@ impl EvictionJob {
             };
         }
         let outcome = match &messages_path {
-            Some(path) => match compio::fs::remove_file(path).await {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => {
-                    warn!(%path, start_offset, %error, "cannot unlink the evicted segment's log");
-                    Err(EvictionFailure::Unlink)
-                }
-            },
+            Some(path) => unlink_log(path, start_offset).await,
             None => Ok(()),
         };
         EvictionResult {
@@ -637,6 +633,30 @@ impl EvictionJob {
             outcome,
         }
     }
+}
+
+/// Unlink an evicted segment's `.log` and sync its directory before the next
+/// eviction may start. Without the sync a power loss could bring this `.log`
+/// back while a later one stays gone, and boot refuses a local segment in
+/// front of a remote one.
+async fn unlink_log(path: &str, start_offset: u64) -> Result<(), EvictionFailure> {
+    match compio::fs::remove_file(path).await {
+        Ok(()) => {}
+        // Gone already, by an unlink no directory sync is known to cover.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(%path, start_offset, %error, "cannot unlink the evicted segment's log");
+            return Err(EvictionFailure::Unlink);
+        }
+    }
+    let directory = Path::new(path)
+        .parent()
+        .and_then(Path::to_str)
+        .ok_or(EvictionFailure::Sync)?;
+    fsync_dir(directory).await.map_err(|error| {
+        warn!(%path, start_offset, %error, "cannot sync the directory after unlinking the evicted segment's log");
+        EvictionFailure::Sync
+    })
 }
 
 impl SegmentChain {

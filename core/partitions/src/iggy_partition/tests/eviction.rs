@@ -360,6 +360,52 @@ async fn given_retention_of_an_evicted_segment_when_rebooted_should_accept_the_n
     assert_eq!(partition.chain_trim_point(), Some(first_end));
 }
 
+/// A boot re-anchor leaves a gap its anchor certifies. Once retention removes
+/// the segment before the gap, only the trim point can vouch for the front.
+#[compio::test]
+async fn given_retention_of_the_segment_before_an_anchored_gap_when_rebooted_should_accept_the_front()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let (config, partition) = Box::pin(tiered_partition_on_disk(root.path())).await;
+    let directory = PathBuf::from(config.get_partition_path(1, 1, 0));
+    let first_end = partition
+        .sealed_segment_record(SEALED[0])
+        .unwrap()
+        .end_offset;
+    let planted_start = partition.log.active_segment().start_offset;
+    drop(partition);
+    for extension in ["log", "index"] {
+        std::fs::remove_file(directory.join(format!("{:020}.{extension}", SEALED[1]))).unwrap();
+    }
+    crate::segment_anchor::write_anchor(
+        &directory.to_string_lossy(),
+        crate::segment_anchor::SegmentAnchor {
+            planted_start,
+            sealed_start: SEALED[0],
+            sealed_end: first_end,
+        },
+    )
+    .await
+    .unwrap();
+    let mut partition = Box::pin(reboot(&config)).await;
+    assert_eq!(partition.log.segments().len(), 2);
+
+    Box::pin(partition.remove_sealed_segments_up_to(first_end)).await;
+    Box::pin(settle_partition_io(&mut partition, &config)).await;
+
+    assert_eq!(partition.log.segments().len(), 1);
+    assert_eq!(partition.chain_trim_point(), Some(planted_start - 1));
+    assert_eq!(
+        chain_records(&directory).await.last(),
+        Some(&ChainRecord::TrimPoint(planted_start - 1))
+    );
+    drop(partition);
+
+    let partition = Box::pin(reboot(&config)).await;
+    assert_eq!(partition.log.segments()[0].start_offset, planted_start);
+    assert_eq!(partition.chain_trim_point(), Some(planted_start - 1));
+}
+
 #[compio::test]
 async fn given_a_chain_of_another_incarnation_when_adopting_should_refuse_it() {
     let (directory, partition) =
@@ -407,25 +453,20 @@ async fn given_a_tiered_receiver_when_a_transfer_installs_should_drop_its_chain(
     assert!(!Path::new(&chain_path(&directory.path().to_string_lossy())).exists());
 }
 
-/// The WAL links its checkpoint-cursor segment and boot reads it, so a sealed
-/// segment the checkpoint has not passed stays until the checkpoint moves on.
-#[compio::test]
-async fn given_the_wal_checkpoint_in_a_sealed_segment_when_evicting_should_wait_for_it_to_pass() {
-    const RECORDS_PER_SEGMENT: u64 = 2;
-    let root = tempfile::tempdir().unwrap();
+/// One-message records per segment of [`tiered_partition_with_wal`].
+const WAL_RECORDS_PER_SEGMENT: u64 = 2;
+
+/// A backup with a prepare WAL and a chain under `root`.
+async fn tiered_partition_with_wal(root: &Path) -> (PartitionsConfig, IggyPartition<RecordingBus>) {
     let mut config = repair_config();
-    config.path_layout.streams_root = root.path().to_string_lossy().into_owned();
-    let directory = PathBuf::from(config.get_partition_path(1, 1, 0));
+    config.path_layout.streams_root = root.to_string_lossy().into_owned();
+    let directory = config.get_partition_path(1, 1, 0);
     std::fs::create_dir_all(&directory).unwrap();
     let (mut partition, _) = recording_partition_at(1, 3);
-    partition.set_partition_dir(directory.to_string_lossy().into_owned());
+    partition.set_partition_dir(directory);
     partition.runtime_options.durability = iggy_common::Durability::Replicated;
     partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Replicated;
-    let record_len = checksummed_segment_prepare(1, 0, 0, b"payload")
-        .as_slice()
-        .len()
-        - size_of::<PrepareHeader>();
-    let segment_size = IggyByteSize::from(RECORDS_PER_SEGMENT * record_len as u64);
+    let segment_size = wal_segment_size();
     partition.runtime_options.segment_size = Some(segment_size);
     partition.log.active_segment_mut().max_size = segment_size;
     partition.open_persistence().await.unwrap();
@@ -438,18 +479,64 @@ async fn given_the_wal_checkpoint_in_a_sealed_segment_when_evicting_should_wait_
     Box::pin(partition.open_segment_chain(PREFIX))
         .await
         .unwrap();
+    (config, partition)
+}
+
+fn wal_segment_size() -> IggyByteSize {
+    let record_len = checksummed_segment_prepare(1, 0, 0, b"payload")
+        .as_slice()
+        .len()
+        - size_of::<PrepareHeader>();
+    IggyByteSize::from(WAL_RECORDS_PER_SEGMENT * record_len as u64)
+}
+
+/// Replicate and commit one record per offset, each as op `offset + 1`.
+/// Returns the checksum the next prepare chains to.
+async fn replicate_offsets(
+    partition: &mut IggyPartition<RecordingBus>,
+    config: &PartitionsConfig,
+    offsets: std::ops::RangeInclusive<u64>,
+    mut parent: u128,
+) -> u128 {
     let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
-    let mut parent = 0;
-    for offset in 0..=RECORDS_PER_SEGMENT {
+    for offset in offsets {
         let op = offset + 1;
         let prepare = checksummed_segment_prepare(op, parent, offset, b"payload");
         parent = prepare.header().checksum;
         let writer = hold_wal_writer(&persistence);
         Box::pin(partition.on_replicate(prepare)).await;
         writer.await;
-        Box::pin(commit_on_heartbeat(&mut partition, &config, op)).await;
-        Box::pin(settle_partition_io(&mut partition, &config)).await;
+        Box::pin(commit_on_heartbeat(partition, config, op)).await;
+        Box::pin(settle_partition_io(partition, config)).await;
     }
+    parent
+}
+
+/// Run one WAL checkpoint to its end.
+async fn checkpoint_wal(partition: &mut IggyPartition<RecordingBus>, config: &PartitionsConfig) {
+    let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+    let writer = hold_wal_writer(&persistence);
+    partition.checkpoint_persistence(config).await;
+    Box::pin(settle_partition_io(partition, config)).await;
+    writer.await;
+    Box::pin(settle_partition_io(partition, config)).await;
+}
+
+/// The WAL links its checkpoint-cursor segment and boot reads it, so a sealed
+/// segment the checkpoint has not passed stays until the checkpoint moves on.
+#[compio::test]
+async fn given_the_wal_checkpoint_in_a_sealed_segment_when_evicting_should_wait_for_it_to_pass() {
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut partition) = Box::pin(tiered_partition_with_wal(root.path())).await;
+    let directory = PathBuf::from(config.get_partition_path(1, 1, 0));
+    let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+    Box::pin(replicate_offsets(
+        &mut partition,
+        &config,
+        0..=WAL_RECORDS_PER_SEGMENT,
+        0,
+    ))
+    .await;
     let checkpoint = persistence.segment_checkpoint().unwrap();
     assert_eq!(
         checkpoint.start_offset, 0,
@@ -462,11 +549,7 @@ async fn given_the_wal_checkpoint_in_a_sealed_segment_when_evicting_should_wait_
     assert!(directory.join(format!("{:020}.log", 0)).is_file());
     assert!(partition.needs_persistence_checkpoint());
 
-    let writer = hold_wal_writer(&persistence);
-    partition.checkpoint_persistence(&config).await;
-    Box::pin(settle_partition_io(&mut partition, &config)).await;
-    writer.await;
-    Box::pin(settle_partition_io(&mut partition, &config)).await;
+    Box::pin(checkpoint_wal(&mut partition, &config)).await;
     let moved = persistence.segment_checkpoint().unwrap();
     assert!(
         moved.start_offset > 0,
@@ -478,6 +561,102 @@ async fn given_the_wal_checkpoint_in_a_sealed_segment_when_evicting_should_wait_
         SegmentLocation::Remote
     );
     assert!(!directory.join(format!("{:020}.log", 0)).exists());
+}
+
+/// Boot marks every recovered segment dirty, and a remote one has no `.log`
+/// for the checkpoint to sync.
+#[compio::test]
+async fn given_an_evicted_segment_when_checkpointing_after_a_reboot_should_not_need_its_log() {
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut partition) = Box::pin(tiered_partition_with_wal(root.path())).await;
+    let directory = config.get_partition_path(1, 1, 0);
+    let parent = Box::pin(replicate_offsets(
+        &mut partition,
+        &config,
+        0..=WAL_RECORDS_PER_SEGMENT,
+        0,
+    ))
+    .await;
+    confirm(&mut partition, &[0]);
+    partition.persistence.as_ref().unwrap().request_checkpoint();
+    Box::pin(checkpoint_wal(&mut partition, &config)).await;
+    Box::pin(evict(&mut partition, u64::MAX, KEEP_NOTHING)).await;
+    assert_eq!(
+        partition.log.segments()[0].location,
+        SegmentLocation::Remote
+    );
+    let uncheckpointed = WAL_RECORDS_PER_SEGMENT + 1;
+    Box::pin(replicate_offsets(
+        &mut partition,
+        &config,
+        uncheckpointed..=uncheckpointed,
+        parent,
+    ))
+    .await;
+    hold_wal_writer(partition.persistence.as_ref().unwrap()).await;
+    drop(partition);
+
+    // The server's order: the WAL is read before recovery cuts the segments
+    // back to its checkpoint.
+    let wal = Path::new(&directory).join("prepares-0");
+    let recovered_wal = PartitionPersistence::open(&wal, IggyNamespace::new(1, 1, 0).inner(), 0)
+        .await
+        .unwrap();
+    let recovered = crate::segment_recovery::load_persisted_segments_with_checkpoint(
+        &config,
+        IggyNamespace::new(1, 1, 0),
+        wal_segment_size(),
+        false,
+        &PartitionStats::default(),
+        recovered_wal.0.segment_checkpoint(),
+    )
+    .await
+    .unwrap();
+    let (mut partition, _) = recording_partition_at(1, 3);
+    partition.set_partition_dir(directory.clone());
+    partition.runtime_options.durability = iggy_common::Durability::Replicated;
+    partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Replicated;
+    partition.runtime_options.segment_size = Some(wal_segment_size());
+    partition.log.retire_front().unwrap();
+    crate::partition_storage::hydrate_partition_log(&mut partition, &directory, 1, 1, 0, recovered)
+        .await
+        .unwrap();
+    partition
+        .open_persistence_with_recovered(
+            journal::partition_journal::PARTITION_WAL_BYTES_MAX,
+            std::time::Duration::ZERO,
+            Some(recovered_wal),
+        )
+        .await
+        .unwrap();
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+    assert_eq!(
+        partition.log.segments()[0].location,
+        SegmentLocation::Remote
+    );
+    let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+    let before = persistence.checkpoint_op();
+    Box::pin(commit_on_heartbeat(
+        &mut partition,
+        &config,
+        uncheckpointed + 1,
+    ))
+    .await;
+    Box::pin(settle_partition_io(&mut partition, &config)).await;
+
+    persistence.request_checkpoint();
+    Box::pin(checkpoint_wal(&mut partition, &config)).await;
+
+    assert!(
+        persistence.failure().is_none(),
+        "{:?}",
+        persistence.failure()
+    );
+    assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+    assert!(persistence.checkpoint_op() > before);
 }
 
 /// The record is durable before the unlink, so a failed unlink costs only a

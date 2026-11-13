@@ -760,8 +760,8 @@ struct PendingPartitionMaintenance {
     checkpoint: Option<PendingCheckpoint>,
     retention: Option<u64>,
     removing: Option<Segment>,
-    /// The removal appends a trim point at the removed segment's end.
-    removal_trim: bool,
+    /// The trim point the removal appends before it unlinks.
+    removal_trim: Option<u64>,
     eviction: Option<u64>,
 }
 
@@ -2099,13 +2099,15 @@ where
                     .sum::<usize>(),
         );
         for start_offset in segments {
-            // Retention may already have removed a dirty sealed segment.
-            if self
+            // Retention may already have removed a dirty sealed segment, and
+            // an evicted one has no `.log` left to sync: boot marks every
+            // recovered segment dirty, remote ones included.
+            let local = self
                 .log
                 .segments()
                 .binary_search_by_key(&start_offset, |segment| segment.start_offset)
-                .is_err()
-            {
+                .is_ok_and(|slot| self.log.segments()[slot].location != SegmentLocation::Remote);
+            if !local {
                 continue;
             }
             paths.push(config.get_messages_path(
@@ -12824,12 +12826,22 @@ where
             .remove(&segment.start_offset);
         // Boot refuses a front above the trim point, and keeps no record at or
         // below it, so the trim point must cover the segment before it goes.
+        // It runs up to the next segment: the anchor that certifies a gap
+        // between the two names the segment leaving now, so past this removal
+        // only the trim point vouches for the new front.
+        let trim_point = self
+            .log
+            .segments()
+            .first()
+            .map_or(segment.end_offset, |next| {
+                next.start_offset.saturating_sub(1).max(segment.end_offset)
+            });
         let trim = self
             .segment_chain
             .as_ref()
-            .and_then(|chain| chain.trim(segment.end_offset))
+            .and_then(|chain| chain.trim(trim_point))
             .map(Box::new);
-        self.maintenance.removal_trim = trim.is_some();
+        self.maintenance.removal_trim = trim.as_ref().map(|_| trim_point);
         self.maintenance.removing = Some(segment);
         self.clear_state_transfer_offer_cache();
         Some(crate::PartitionIoJob::RemoveSegment {
@@ -12843,15 +12855,13 @@ where
     }
 
     fn accept_segment_removal(&mut self, result: &crate::PartitionIoResult) -> Option<u64> {
-        let trimmed = std::mem::take(&mut self.maintenance.removal_trim);
+        let trim_point = self.maintenance.removal_trim.take();
         if !matches!(result, crate::PartitionIoResult::SegmentRemoved(Ok(()))) {
             return None;
         }
         let segment = self.maintenance.removing.take()?;
-        if trimmed && let Some(chain) = self.segment_chain.as_mut() {
-            chain.note_appended(&crate::segment_chain::ChainRecord::TrimPoint(
-                segment.end_offset,
-            ));
+        if let (Some(trim_point), Some(chain)) = (trim_point, self.segment_chain.as_mut()) {
+            chain.note_appended(&crate::segment_chain::ChainRecord::TrimPoint(trim_point));
         }
         let (messages, shortfall) = settle_cleaned_segment(&self.stats, &segment);
         shortfall.report(
@@ -12942,11 +12952,10 @@ where
 
     fn eviction_is_ready(&mut self, through: u64) -> bool {
         let segments = self.log.segments();
+        let slot = self.first_local_slot();
         let next = segments
-            .iter()
-            .position(|segment| segment.location != SegmentLocation::Remote)
-            .filter(|slot| slot + 1 < segments.len())
-            .map(|slot| &segments[slot])
+            .get(slot)
+            .filter(|_| slot + 1 < segments.len())
             .filter(|segment| {
                 segment.sealed
                     && segment.end_offset <= through
@@ -12974,13 +12983,18 @@ where
         true
     }
 
-    fn capture_segment_eviction(&self) -> Option<crate::PartitionIoJob<SB>> {
-        let slot = self
-            .log
+    /// The slot of the first segment still on local disk. Remote segments are
+    /// always the front of the list, so a binary search finds where they end
+    /// without walking a prefix that grows with every eviction.
+    fn first_local_slot(&self) -> usize {
+        self.log
             .segments()
-            .iter()
-            .position(|segment| segment.location != SegmentLocation::Remote)?;
-        let start_offset = self.log.segments()[slot].start_offset;
+            .partition_point(|segment| segment.location == SegmentLocation::Remote)
+    }
+
+    fn capture_segment_eviction(&self) -> Option<crate::PartitionIoJob<SB>> {
+        let slot = self.first_local_slot();
+        let start_offset = self.log.segments().get(slot)?.start_offset;
         let messages_path = self.log.storages()[slot].segment_and_index_paths().0;
         let job = self
             .segment_chain
@@ -12994,9 +13008,9 @@ where
     /// as retention does after an unlink. Returns whether the segment left the
     /// disk.
     ///
-    /// A record that may not be durable fails like any other durability
-    /// failure. A failed unlink only ends the pass: the record is durable, so
-    /// the next pass retries the unlink alone.
+    /// A record or an unlink that may not be durable fails like any other
+    /// durability failure. A failed unlink only ends the pass: the record is
+    /// durable, so the next pass retries the unlink alone.
     fn accept_segment_eviction(
         &mut self,
         result: crate::PartitionIoResult,
@@ -13018,6 +13032,9 @@ where
             }
             Err(crate::segment_chain::EvictionFailure::Record) => {
                 return Err(IggyError::CannotWriteToFile);
+            }
+            Err(crate::segment_chain::EvictionFailure::Sync) => {
+                return Err(IggyError::CannotSyncFile);
             }
         }
         let slot = self
