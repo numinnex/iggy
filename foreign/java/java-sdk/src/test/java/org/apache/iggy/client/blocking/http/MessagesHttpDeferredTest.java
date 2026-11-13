@@ -646,6 +646,23 @@ class MessagesHttpDeferredTest {
         }
     }
 
+    /** A refused read returns no messages, so a committing poll stored nothing and leaves its partition open. */
+    @Test
+    void shouldReportATieredReadFailureOfACommittingPollWithoutABlock() throws Exception {
+        var peer = new FakePeer(exchange -> respond(exchange, FAILED_DEPENDENCY, TIERED_READ_FAILED));
+        try (var server = peer.start();
+                var client = client(peer)) {
+
+            for (int poll = 0; poll < 2; poll++) {
+                assertThatThrownBy(() -> committingPoll(client))
+                        .isInstanceOf(IggyServerException.class)
+                        .extracting(error -> ((IggyServerException) error).getErrorCode())
+                        .isEqualTo(IggyErrorCode.TIERED_READ_FAILED);
+            }
+            assertThat(peer.queries).hasSize(2);
+        }
+    }
+
     @Test
     void shouldNotReplayAnAmbiguousRefusal() throws Exception {
         var peer = new FakePeer(exchange -> respond(exchange, SERVICE_UNAVAILABLE, NOT_COMMITTED));
