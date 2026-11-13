@@ -899,12 +899,18 @@ impl SegmentState {
     /// recovered into the same segment, else the tail's or the checkpoint's,
     /// which cover the one segment that can open before the oldest record.
     ///
+    /// The checkpoint's own prepare is the exception. A reanchor or a transfer
+    /// that installs no body for it moves both cursors off its segment, and no
+    /// rewind lands on the checkpoint, so its stamp is never read and is zero.
+    ///
     /// # Errors
-    /// Returns an error for a body in a segment whose first batch is unknown.
+    /// Returns an error for a body above the checkpoint in a segment whose
+    /// first batch is unknown.
     pub(super) fn recovered_first_timestamp(
         &self,
         reference: SegmentReference,
         prepare: &[u8],
+        checkpoint_prepare: bool,
         previous: &mut Option<((u64, u64), u64)>,
     ) -> io::Result<u64> {
         if self.max_age.is_none() {
@@ -915,9 +921,12 @@ impl SegmentState {
             decode_batch(prepare)?.base_timestamp
         } else if let Some((_, first)) = previous.filter(|(segment, _)| *segment == key) {
             first
+        } else if let Some(first) = self.cursor_first_timestamp(reference) {
+            first
+        } else if checkpoint_prepare {
+            return Ok(0);
         } else {
-            self.cursor_first_timestamp(reference)
-                .ok_or_else(|| invalid("recovered segment body has no known first batch"))?
+            return Err(invalid("recovered segment body has no known first batch"));
         };
         *previous = Some((key, first));
         Ok(first)

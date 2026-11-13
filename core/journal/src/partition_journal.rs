@@ -1085,19 +1085,20 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         while position < state.length {
             let (header, length, prepare, reference) =
                 self.read_record(position, state.length).await?;
+            let checkpoint_prepare = position == 0 && state.checkpoint_prepare;
             let (next_offset, segment_first_timestamp) = match (state.segment_storage, reference) {
                 (Some(segments), Some(reference)) => (
                     Some(segments::batch_next_offset(prepare.as_slice())?),
                     segments.recovered_first_timestamp(
                         reference,
                         prepare.as_slice(),
+                        checkpoint_prepare,
                         &mut previous_segment,
                     )?,
                 ),
                 _ => (None, 0),
             };
             self.recovered_prepares.push(prepare);
-            let checkpoint_prepare = position == 0 && state.checkpoint_prepare;
             if checkpoint_prepare {
                 if header.op != state.checkpoint || header.checksum != state.checkpoint_checksum {
                     return Err(invalid("partition WAL checkpoint prepare mismatch"));
@@ -3860,6 +3861,101 @@ mod tests {
         }
 
         assert_eq!(segment_starts(&journal), [0, 2]);
+    }
+
+    #[compio::test]
+    async fn given_an_aged_checkpoint_inside_a_segment_when_reanchored_should_reopen_and_append() {
+        const RESERVED_OFFSET: u64 = 8;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = aged_journal(partition.path()).await;
+        let first = timed_segment_prepare(1, 0, 0, AGE_BODY_BYTES, 1_000);
+        let second = timed_segment_prepare(2, first.header().checksum, 1, AGE_BODY_BYTES, 1_050);
+        journal.append(first.into_frozen()).await.unwrap();
+        journal.append(second.clone().into_frozen()).await.unwrap();
+        journal.checkpoint(2).await.unwrap();
+        // The checkpoint prepare stays in segment 0, past its first batch,
+        // while both cursors move to the empty segment at the reserved offset.
+        journal
+            .reanchor_segment_storage(RESERVED_OFFSET)
+            .await
+            .unwrap();
+        drop(journal);
+
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            journal.prepares().await.unwrap()[0].as_slice(),
+            second.as_slice()
+        );
+        let mut parent = second.header().checksum;
+        for (op, stamp) in [(3, 5_000), (4, 5_099), (5, 5_100)] {
+            let prepare =
+                timed_segment_prepare(op, parent, RESERVED_OFFSET + op - 3, AGE_BODY_BYTES, stamp);
+            parent = prepare.header().checksum;
+            journal.append(prepare.into_frozen()).await.unwrap();
+        }
+        assert_eq!(
+            segment_starts(&journal),
+            [0, RESERVED_OFFSET, RESERVED_OFFSET + 2]
+        );
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.head(), 5);
+    }
+
+    #[compio::test]
+    async fn given_an_aged_checkpoint_inside_a_segment_when_an_empty_transfer_installs_should_reopen()
+     {
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = aged_journal(partition.path()).await;
+        let first = timed_segment_prepare(1, 0, 0, AGE_BODY_BYTES, 1_000);
+        let second = timed_segment_prepare(2, first.header().checksum, 1, AGE_BODY_BYTES, 1_050);
+        journal.append(first.into_frozen()).await.unwrap();
+        journal.append(second.clone().into_frozen()).await.unwrap();
+        // No transferred body: the checkpoint prepare keeps its reference into
+        // segment 0, and both cursors start an empty segment after it.
+        journal
+            .reset_with_segment_checkpoint(
+                2,
+                Some(second.header().checksum),
+                Some(second.clone().into_frozen()),
+                SegmentPosition {
+                    start_offset: 2,
+                    length: 0,
+                    next_offset: 2,
+                    first_timestamp: 0,
+                },
+                AGE_SEGMENT_BYTES,
+                Some(MAX_AGE),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            journal.segment_reference(second.header()).unwrap().position,
+            AGE_BODY_BYTES as u64
+        );
+        drop(journal);
+
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            journal.prepares().await.unwrap()[0].as_slice(),
+            second.as_slice()
+        );
+        let mut parent = second.header().checksum;
+        for (op, stamp) in [(3, 5_000), (4, 5_099), (5, 5_100)] {
+            let prepare = timed_segment_prepare(op, parent, op - 1, AGE_BODY_BYTES, stamp);
+            parent = prepare.header().checksum;
+            journal.append(prepare.into_frozen()).await.unwrap();
+        }
+        assert_eq!(segment_starts(&journal), [0, 2, 4]);
     }
 
     fn segment_names(partition: &Path) -> Vec<String> {
