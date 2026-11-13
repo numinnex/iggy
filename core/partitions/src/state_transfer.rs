@@ -2845,10 +2845,15 @@ where
     ) -> Result<TransferPlan, PartitionTransferUnavailable> {
         let memos = self.segment_checksum_cache.borrow();
         let mut segments = Vec::with_capacity(self.log.segments().len());
+        let mut without_log = Vec::new();
         for (segment, storage) in self.log.segments().iter().zip(self.log.storages()) {
             let size = segment.size.as_bytes_u64();
             // A segment whose `.log` left the disk travels as its chain record.
-            if size == 0 || segment.location == SegmentLocation::Remote {
+            if segment.location == SegmentLocation::Remote {
+                without_log.push(segment.start_offset);
+                continue;
+            }
+            if size == 0 {
                 continue;
             }
             let (log_path, _) = storage.segment_and_index_paths();
@@ -2872,7 +2877,9 @@ where
         Ok(TransferPlan {
             commit_op: self.consensus().commit_min(),
             segments,
-            chain: self.segment_chain_snapshot(),
+            // The same pass decides which segments send bytes and which the
+            // chain marks remote, so the two never name one segment twice.
+            chain: self.segment_chain_snapshot(&without_log),
             offsets: self.offsets_wire_snapshot()?,
         })
     }

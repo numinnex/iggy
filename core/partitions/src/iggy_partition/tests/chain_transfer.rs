@@ -204,6 +204,64 @@ async fn given_a_tiered_offer_when_installed_should_hold_the_senders_chain_and_b
     assert_eq!(rebooted.object_prefix(), Some(PREFIX));
 }
 
+/// An eviction whose record is durable but whose `.log` stayed: the segment
+/// is still local, so its bytes travel and its record travels as sealed.
+#[compio::test]
+async fn given_an_eviction_cut_short_before_its_unlink_when_offering_should_send_the_segment_as_local()
+ {
+    let (directory, origin) = Box::pin(tiered_partition(&segment_records(ORIGIN_OPS), 0)).await;
+    let mut origin = Box::new(origin);
+    confirm(&mut origin, &ORIGIN_SEALED);
+    let floor = origin.sealed_segment_record(2).unwrap().end_offset;
+    let log = directory.path().join(format!("{:020}.log", 2));
+    let bytes = std::fs::read(&log).unwrap();
+    // Unlinking a directory fails even for root.
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir(&log).unwrap();
+    Box::pin(evict(&mut origin, floor, KEEP_NOTHING)).await;
+    std::fs::remove_dir(&log).unwrap();
+    std::fs::write(&log, bytes).unwrap();
+    let sealed = ORIGIN_SEALED.map(|start| origin.sealed_segment_record(start).unwrap());
+    assert_eq!(
+        chain_records(directory.path()).await[3..],
+        [
+            ChainRecord::Remote(sealed[0]),
+            ChainRecord::Remote(sealed[1])
+        ],
+        "the interrupted eviction left its record"
+    );
+    assert_eq!(
+        locations(&origin),
+        [
+            SegmentLocation::Remote,
+            SegmentLocation::Local,
+            SegmentLocation::Local,
+            SegmentLocation::Local
+        ]
+    );
+
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+
+    let offered: Vec<u64> = offer
+        .segments
+        .iter()
+        .map(|source| source.entry.frontier)
+        .collect();
+    assert_eq!(offered, [2, 4, 6]);
+    assert_eq!(
+        offered_chain(&offer).records,
+        [
+            ChainRecord::Remote(sealed[0]),
+            ChainRecord::Sealed(sealed[1]),
+            ChainRecord::Sealed(sealed[2]),
+        ]
+    );
+    let root = tempfile::tempdir().unwrap();
+    let (_config, mut receiver) = Box::pin(receiver_on_disk(root.path())).await;
+    Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
+    assert_eq!(layout(&receiver), layout(&origin));
+}
+
 /// The trim point travels, so the receiver's boot accepts the same front.
 #[compio::test]
 async fn given_a_chain_with_a_trim_point_when_installed_should_keep_it() {

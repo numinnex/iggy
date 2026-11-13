@@ -772,11 +772,16 @@ impl SegmentChain {
     /// The chain as a state transfer carries it: the trim point and the latest
     /// record of every live segment, without the records a reader no longer
     /// needs.
-    fn snapshot(&self) -> Chain {
+    ///
+    /// A segment is remote only when `without_log`, ascending, holds its start
+    /// offset. The chain's own remote records do not decide it: an eviction cut
+    /// short after its record leaves the `.log` in place, and that segment
+    /// travels as bytes.
+    fn snapshot(&self, without_log: &[u64]) -> Chain {
         let mut records = Vec::with_capacity(self.sealed.len() + 1);
         records.extend(self.trim_point.map(ChainRecord::TrimPoint));
         records.extend(self.sealed.values().map(|segment| {
-            if self.remote.contains(&segment.start_offset) {
+            if without_log.binary_search(&segment.start_offset).is_ok() {
                 ChainRecord::Remote(*segment)
             } else {
                 ChainRecord::Sealed(*segment)
@@ -945,8 +950,12 @@ where
     }
 
     /// What a state transfer carries of the chain, `None` without one.
-    pub(crate) fn segment_chain_snapshot(&self) -> Option<Chain> {
-        self.segment_chain.as_ref().map(|chain| chain.snapshot())
+    /// `without_log` holds the start offsets of the segments the same transfer
+    /// sends no bytes for, ascending.
+    pub(crate) fn segment_chain_snapshot(&self, without_log: &[u64]) -> Option<Chain> {
+        self.segment_chain
+            .as_ref()
+            .map(|chain| chain.snapshot(without_log))
     }
 
     /// The object prefix the chain records, `None` without a chain.
